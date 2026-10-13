@@ -49,11 +49,12 @@ async fn extracts_every_configured_region() {
             36,
             "{region}: unexpected hash shape"
         );
+        // A store variant (e.g. `<package>.qooapp`) is checked against the
+        // source's `packages` during extraction.
         let package = identity.manifest.as_ref().map(|m| m.package.as_str());
-        assert_eq!(
-            package,
-            Some(region.package_name()),
-            "{region}: wrong package"
+        assert!(
+            package.is_some_and(|p| p.starts_with(region.package_name())),
+            "{region}: wrong package {package:?}"
         );
     }
 }

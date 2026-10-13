@@ -34,15 +34,18 @@ src/
   config.rs          – TOML + SEKAI_APPHASH_* env overrides (figment), Secret type
   state.rs           – Per-region state (fingerprint, identity, delivery digests)
   publish.rs         – Haruki / file / webhook publishers
-  runner.rs          – One pass: probe -> reuse cache or extract -> publish; source
-                       HTTP clients (global and per-region proxy)
+  qooapp.rs          – QooApp v11 store API answer -> package URL + MD5 fingerprint
+  runner.rs          – One pass: per region, try the sources in order (resolve ->
+                       reuse cache or extract), then publish; source HTTP clients
+                       (global and per-source proxy) and channel headers
   service.rs         – Scheduler with jitter, read-only status endpoints (axum)
   logging.rs         – tracing to stderr, text or JSON
   testing.rs         – Synthetic fixture builders (doc-hidden; used by all tests)
 tests/
   pipeline.rs        – Offline end-to-end tests over in-process HTTP servers
+  sources.rs         – QooApp channel, channel headers, source fallback order
   live.rs            – #[ignore] live extraction (needs network + configured sources)
-  support/           – Range server, mock Haruki node, webhook receiver
+  support/           – Range server, mock Haruki node, mock QooApp store, webhook receiver
 ```
 
 ## Key Concepts
@@ -74,6 +77,12 @@ tests/
   configured). The publisher fails closed: anything but a version file means "could not read"
   and nothing is pushed. An empty `appVersion` means "no identity yet" and is pushed only for
   regions in `publish.haruki.bootstrap_regions`.
+- **Sources.** `regions.<r>.url` is one `direct` source; `regions.<r>.sources` lists several,
+  tried in order. A `qooapp` source asks the store API first and uses its MD5 as the
+  fingerprint. Channel header values are credentials (`config::Secret`, sensitive
+  `HeaderValue`s): never log them, and keep them out of committed config (tokens come from
+  `SEKAI_APPHASH_CHANNELS__<NAME>__HEADERS__<HEADER>`). The manifest package must be the
+  region's or listed in the source's `packages`.
 - **Caching.** `state/<region>.json` keeps the source fingerprint (size, ETag, Last-Modified,
   redirect path without query) and the identity. Unchanged fingerprint = no download.
   File/webhook deliveries are skipped when the stable digest (identity without timestamps and

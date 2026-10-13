@@ -105,21 +105,38 @@ impl SourceInfo {
 
 impl AppIdentity {
     /// Builds the identity of `region` from a package scan, checking that the
-    /// package belongs to that region.
+    /// manifest names one of `packages` (empty: the region's own package).
     pub fn from_scan(
         region: ServerRegion,
         platform: &str,
         scan: PackageScan,
+        packages: &[String],
         source: Option<SourceInfo>,
     ) -> Result<Self> {
         if let Some(manifest) = &scan.manifest {
-            if let Some(found) = ServerRegion::from_package(&manifest.package) {
-                if found != region {
-                    return Err(Error::Other(format!(
-                        "package {} belongs to {found}, not {region}",
-                        manifest.package
-                    )));
-                }
+            let allowed = if packages.is_empty() {
+                manifest.package == region.package_name()
+            } else {
+                packages.iter().any(|p| p == &manifest.package)
+            };
+            if !allowed {
+                return Err(Error::Other(
+                    match ServerRegion::from_package(&manifest.package) {
+                        Some(found) if found != region => format!(
+                            "package {} belongs to {found}, not {region}",
+                            manifest.package
+                        ),
+                        _ => format!(
+                            "package {} is not allowed for {region} (allowed: {})",
+                            manifest.package,
+                            if packages.is_empty() {
+                                region.package_name().to_owned()
+                            } else {
+                                packages.join(", ")
+                            }
+                        ),
+                    },
+                ));
             }
         }
         let config = unity::production(&scan.unity.configs, platform).ok_or_else(|| {
@@ -241,6 +258,7 @@ mod tests {
             ServerRegion::Tw,
             "android",
             scan(vec![prod, staging], "com.hermes.mk.asia"),
+            &[],
             None,
         )
         .unwrap();
@@ -262,6 +280,7 @@ mod tests {
                 vec![sample("production_android", ("6", "4", "1"), "h")],
                 "com.hermes.mk.asia",
             ),
+            &[],
             None,
         );
         assert!(wrong.unwrap_err().to_string().contains("belongs to tw"));
@@ -273,12 +292,55 @@ mod tests {
                 vec![sample("staging1_android", ("6", "4", "1"), "h")],
                 "com.hermes.mk.asia",
             ),
+            &[],
             None,
         );
         assert!(missing
             .unwrap_err()
             .to_string()
             .contains("staging1_android"));
+    }
+
+    #[test]
+    fn store_variants_need_an_allow_list() {
+        let config = || vec![sample("production_android", ("6", "4", "1"), "h")];
+        let qoo = "com.hermes.mk.asia.qooapp";
+        let refused =
+            AppIdentity::from_scan(ServerRegion::Tw, "android", scan(config(), qoo), &[], None);
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("not allowed for tw"), "{error}");
+
+        let allowed = ["com.hermes.mk.asia".to_owned(), qoo.to_owned()];
+        let identity = AppIdentity::from_scan(
+            ServerRegion::Tw,
+            "android",
+            scan(config(), qoo),
+            &allowed,
+            None,
+        )
+        .unwrap();
+        assert_eq!(identity.manifest.unwrap().package, qoo);
+        // The list replaces the default: the plain package needs listing too.
+        let only_qoo = [qoo.to_owned()];
+        assert!(AppIdentity::from_scan(
+            ServerRegion::Tw,
+            "android",
+            scan(config(), "com.hermes.mk.asia"),
+            &only_qoo,
+            None
+        )
+        .is_err());
+        // Another region's package is still named as such.
+        let error = AppIdentity::from_scan(
+            ServerRegion::Tw,
+            "android",
+            scan(config(), "com.pjsekai.kr"),
+            &allowed,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("belongs to kr"), "{error}");
     }
 
     #[test]

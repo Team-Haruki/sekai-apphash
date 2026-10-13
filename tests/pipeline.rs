@@ -72,7 +72,7 @@ async fn extracts_through_redirects_with_range_requests() {
     let error = runner.extract(ServerRegion::Kr).await.unwrap_err();
     assert!(error.to_string().contains("belongs to tw"), "{error}");
     let error = runner.extract(ServerRegion::Tw).await.unwrap_err();
-    assert!(error.to_string().contains("not configured"), "{error}");
+    assert!(error.to_string().contains("no enabled source"), "{error}");
 }
 
 #[tokio::test]

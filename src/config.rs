@@ -2,7 +2,10 @@
 //!
 //! Nested keys are separated by a double underscore in the environment, e.g.
 //! `SEKAI_APPHASH_PUBLISH__HARUKI__TOKEN` sets `publish.haruki.token` and
-//! `SEKAI_APPHASH_REGIONS__JP__URL` sets `regions.jp.url`.
+//! `SEKAI_APPHASH_REGIONS__JP__URL` sets `regions.jp.url`. Header names of a
+//! channel are matched with `_` read as `-`, so
+//! `SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN` sets the `x-user-token`
+//! header of the `qoo` channel.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -71,6 +74,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     pub service: ServiceConfig,
     pub regions: BTreeMap<ServerRegion, RegionConfig>,
+    /// Named request header sets that sources select with `channel`.
+    pub channels: BTreeMap<String, ChannelConfig>,
     pub publish: PublishConfig,
 }
 
@@ -167,15 +172,18 @@ pub struct ServiceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RegionConfig {
     pub enabled: bool,
-    /// Download URL of the package (APK, XAPK or IPA); must serve byte ranges.
+    /// Shorthand for a single `direct` source: download URL of the package
+    /// (APK, XAPK or IPA); must serve byte ranges. Not combined with `sources`.
     pub url: String,
-    /// Extra request headers for this source.
+    /// Extra request headers for the `url` source.
     pub headers: BTreeMap<String, String>,
     /// Which production config to report: `android` or `ios`.
     pub platform: String,
-    /// Proxy for this source only: unset inherits `http.proxy`, `""` connects
+    /// Proxy for the `url` source: unset inherits `http.proxy`, `""` connects
     /// directly, anything else is a proxy URL.
     pub proxy: Option<String>,
+    /// Sources tried in order until one yields the identity.
+    pub sources: Vec<SourceConfig>,
 }
 
 impl Default for RegionConfig {
@@ -186,7 +194,184 @@ impl Default for RegionConfig {
             headers: BTreeMap::new(),
             platform: "android".into(),
             proxy: None,
+            sources: Vec::new(),
         }
+    }
+}
+
+impl RegionConfig {
+    /// The sources in order: `sources`, or the `url` shorthand as one direct
+    /// source.
+    #[must_use]
+    pub fn effective_sources(&self) -> Vec<SourceConfig> {
+        if !self.sources.is_empty() || self.url.trim().is_empty() {
+            return self.sources.clone();
+        }
+        vec![SourceConfig {
+            download_url: self.url.clone(),
+            headers: self.headers.clone(),
+            proxy: self.proxy.clone(),
+            ..SourceConfig::default()
+        }]
+    }
+
+    /// Whether any enabled source is configured.
+    #[must_use]
+    pub fn has_enabled_source(&self) -> bool {
+        self.effective_sources().iter().any(|s| s.enabled)
+    }
+}
+
+/// How a source finds its package.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    /// `download_url` is the package itself (an APK mirror or the official
+    /// download); changes are detected from its size, ETag and Last-Modified.
+    #[default]
+    Direct,
+    /// A QooApp store: `check_url` is the app's v11 store API entry; the
+    /// package comes from `download_url` with `{package_id}` filled in, or
+    /// from the asset-pack split the API lists. Changes are detected from the
+    /// MD5 the API reports.
+    Qooapp,
+}
+
+impl SourceKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Qooapp => "qooapp",
+        }
+    }
+}
+
+/// One way to obtain a region's package.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SourceConfig {
+    #[serde(alias = "enable")]
+    pub enabled: bool,
+    /// Label for logs; defaults to the channel or the kind.
+    pub name: String,
+    pub kind: SourceKind,
+    /// Store API URL (`qooapp`).
+    pub check_url: String,
+    /// The package URL (`direct`), or its template with `{package_id}`
+    /// (`qooapp`). Must serve byte ranges after redirects.
+    #[serde(alias = "url")]
+    pub download_url: String,
+    /// The `channels` entry whose headers every request of this source sends.
+    pub channel: String,
+    /// Extra plain request headers for this source.
+    pub headers: BTreeMap<String, String>,
+    /// Unset inherits `http.proxy`, `""` connects directly, anything else is
+    /// a proxy URL.
+    pub proxy: Option<String>,
+    /// Android package names this source may serve for the region; empty
+    /// means only the region's own package.
+    pub packages: Vec<String>,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: String::new(),
+            kind: SourceKind::Direct,
+            check_url: String::new(),
+            download_url: String::new(),
+            channel: String::new(),
+            headers: BTreeMap::new(),
+            proxy: None,
+            packages: Vec::new(),
+        }
+    }
+}
+
+impl SourceConfig {
+    /// The name used in logs and errors.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        if !self.name.trim().is_empty() {
+            &self.name
+        } else if !self.channel.trim().is_empty() {
+            &self.channel
+        } else {
+            self.kind.as_str()
+        }
+    }
+}
+
+/// A named set of request headers. Every value is treated as a credential:
+/// it is never logged or printed. Put tokens in the environment, e.g.
+/// `SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN`, never in the file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelConfig {
+    /// Header name -> value; `_` in a name is read as `-`. Transport headers
+    /// the client manages (`Accept-Encoding`, `Connection`, `Keep-Alive`,
+    /// `Host`, `Range`, `Content-Length`) are ignored.
+    pub headers: BTreeMap<String, Secret>,
+    /// Headers that must be non-empty; while one is empty, the channel's
+    /// sources are skipped without sending a request.
+    pub required_headers: Vec<String>,
+}
+
+/// Headers a channel may not set: the HTTP client manages them.
+const TRANSPORT_HEADERS: [&str; 6] = [
+    "accept-encoding",
+    "connection",
+    "keep-alive",
+    "host",
+    "range",
+    "content-length",
+];
+
+/// A header name as configured, normalized: lowercase, `_` read as `-`.
+#[must_use]
+pub fn normalize_header_name(name: &str) -> String {
+    name.trim().replace('_', "-").to_ascii_lowercase()
+}
+
+impl ChannelConfig {
+    /// The headers to send, normalized and without transport headers. When a
+    /// name appears twice (`x-user-token` in the file, `x_user_token` from
+    /// the environment), the non-empty value wins.
+    pub fn resolved_headers(&self) -> Result<BTreeMap<String, Secret>> {
+        let mut out: BTreeMap<String, Secret> = BTreeMap::new();
+        for (name, value) in &self.headers {
+            let name = normalize_header_name(name);
+            if TRANSPORT_HEADERS.contains(&name.as_str()) {
+                continue;
+            }
+            match out.get(&name) {
+                Some(existing)
+                    if !existing.is_empty() && !value.is_empty() && existing != value =>
+                {
+                    return Err(Error::Config(format!(
+                        "header {name} is set twice with different values"
+                    )));
+                }
+                Some(existing) if !existing.is_empty() => {}
+                _ => {
+                    out.insert(name, value.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Names of required headers that are empty or missing.
+    #[must_use]
+    pub fn missing_required(&self) -> Vec<String> {
+        let headers = self.resolved_headers().unwrap_or_default();
+        self.required_headers
+            .iter()
+            .map(|name| normalize_header_name(name))
+            .filter(|name| headers.get(name).is_none_or(Secret::is_empty))
+            .collect()
     }
 }
 
@@ -304,12 +489,25 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        for (region, source) in &self.regions {
-            if !matches!(source.platform.as_str(), "android" | "ios") {
+        for (region, config) in &self.regions {
+            if !matches!(config.platform.as_str(), "android" | "ios") {
                 return Err(Error::Config(format!(
                     "regions.{region}.platform must be android or ios"
                 )));
             }
+            if !config.url.trim().is_empty() && !config.sources.is_empty() {
+                return Err(Error::Config(format!(
+                    "regions.{region}: set either url or sources, not both"
+                )));
+            }
+            for (index, source) in config.sources.iter().enumerate() {
+                self.validate_source(&format!("regions.{region}.sources[{index}]"), source)?;
+            }
+        }
+        for (name, channel) in &self.channels {
+            channel
+                .resolved_headers()
+                .map_err(|e| Error::Config(format!("channels.{name}: {e}")))?;
         }
         if let Some(haruki) = self.publish.haruki.as_ref().filter(|h| h.enabled) {
             if haruki.base_url.trim().is_empty() {
@@ -342,7 +540,32 @@ impl Config {
         Ok(())
     }
 
-    /// Enabled regions with a source, in the canonical order.
+    fn validate_source(&self, at: &str, source: &SourceConfig) -> Result<()> {
+        if source.download_url.trim().is_empty() {
+            return Err(Error::Config(format!("{at}.download_url is required")));
+        }
+        if source.kind == SourceKind::Qooapp {
+            if source.check_url.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "{at}.check_url is required for a qooapp source"
+                )));
+            }
+            if !source.download_url.contains("{package_id}") {
+                return Err(Error::Config(format!(
+                    "{at}.download_url must contain {{package_id}}"
+                )));
+            }
+        }
+        if !source.channel.is_empty() && !self.channels.contains_key(&source.channel) {
+            return Err(Error::Config(format!(
+                "{at}.channel {:?} is not defined under channels",
+                source.channel
+            )));
+        }
+        Ok(())
+    }
+
+    /// Enabled regions with an enabled source, in the canonical order.
     #[must_use]
     pub fn enabled_regions(&self) -> Vec<ServerRegion> {
         ServerRegion::ALL
@@ -350,7 +573,7 @@ impl Config {
             .filter(|region| {
                 self.regions
                     .get(region)
-                    .is_some_and(|source| source.enabled && !source.url.trim().is_empty())
+                    .is_some_and(|config| config.enabled && config.has_enabled_source())
             })
             .collect()
     }
@@ -457,6 +680,148 @@ url = "https://example.invalid/hook"
             assert!(config.publish.webhooks.contains_key("example"));
             Ok(())
         });
+    }
+
+    #[test]
+    fn sources_and_channels_load_with_the_token_from_the_environment() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "c.toml",
+                r#"
+[regions.tw]
+[[regions.tw.sources]]
+name = "apkpure"
+url = "https://example.invalid/tw.xapk"
+[[regions.tw.sources]]
+enable = false
+kind = "qooapp"
+check_url = "https://store.example.invalid/store/v11/apps/1"
+download_url = "https://dl.example.invalid/v11/apps/{package_id}/download"
+channel = "qoo"
+proxy = ""
+packages = ["com.hermes.mk.asia", "com.hermes.mk.asia.qooapp"]
+
+[regions.kr]
+url = "https://example.invalid/kr.xapk"
+proxy = ""
+
+[channels.qoo]
+required_headers = ["x-user-token"]
+[channels.qoo.headers]
+Accept = "*/*"
+Accept-Encoding = "gzip, deflate, br"
+x-device-id = ""
+x-user-token = ""
+"#,
+            )?;
+            jail.set_env(
+                "SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN",
+                "token-from-env",
+            );
+            let config = Config::load(Some(Path::new("c.toml"))).expect("config loads");
+            let tw = &config.regions[&ServerRegion::Tw];
+            assert_eq!(tw.sources.len(), 2);
+            assert_eq!(tw.sources[0].kind, SourceKind::Direct);
+            assert_eq!(tw.sources[0].label(), "apkpure");
+            assert!(!tw.sources[1].enabled);
+            assert_eq!(tw.sources[1].label(), "qoo");
+            assert_eq!(tw.sources[1].proxy.as_deref(), Some(""));
+            // The url shorthand is one direct source.
+            let kr = config.regions[&ServerRegion::Kr].effective_sources();
+            assert_eq!(kr.len(), 1);
+            assert_eq!(kr[0].download_url, "https://example.invalid/kr.xapk");
+            assert_eq!(kr[0].proxy.as_deref(), Some(""));
+
+            let qoo = &config.channels["qoo"];
+            let headers = qoo.resolved_headers().unwrap();
+            assert_eq!(headers["x-user-token"].expose(), "token-from-env");
+            assert_eq!(headers["accept"].expose(), "*/*");
+            assert!(!headers.contains_key("accept-encoding"));
+            assert!(qoo.missing_required().is_empty());
+            assert!(!format!("{config:?}").contains("token-from-env"));
+
+            jail.set_env("SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN", "");
+            let config = Config::load(Some(Path::new("c.toml"))).expect("config loads");
+            assert_eq!(config.channels["qoo"].missing_required(), ["x-user-token"]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_inconsistent_sources() {
+        let source = |kind, check: &str, download: &str, channel: &str| SourceConfig {
+            kind,
+            check_url: check.into(),
+            download_url: download.into(),
+            channel: channel.into(),
+            ..SourceConfig::default()
+        };
+        let template = "https://example.invalid/{package_id}";
+        let cases = [
+            (
+                source(SourceKind::Direct, "", "", ""),
+                "download_url is required",
+            ),
+            (
+                source(SourceKind::Qooapp, "", template, ""),
+                "check_url is required",
+            ),
+            (
+                source(
+                    SourceKind::Qooapp,
+                    "https://x.invalid",
+                    "https://x.invalid/a",
+                    "",
+                ),
+                "{package_id}",
+            ),
+            (
+                source(SourceKind::Direct, "", "https://x.invalid", "nope"),
+                "not defined under channels",
+            ),
+        ];
+        for (source, expected) in cases {
+            let mut config = Config::default();
+            config.regions.insert(
+                ServerRegion::Jp,
+                RegionConfig {
+                    sources: vec![source],
+                    ..RegionConfig::default()
+                },
+            );
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let mut config = Config::default();
+        config.regions.insert(
+            ServerRegion::Jp,
+            RegionConfig {
+                url: "https://x.invalid".into(),
+                sources: vec![source(SourceKind::Direct, "", "https://y.invalid", "")],
+                ..RegionConfig::default()
+            },
+        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not both"));
+
+        let mut config = Config::default();
+        config.channels.insert(
+            "qoo".into(),
+            ChannelConfig {
+                headers: [
+                    ("x-user-token".to_owned(), Secret::new("a")),
+                    ("x_user_token".to_owned(), Secret::new("b")),
+                ]
+                .into(),
+                required_headers: Vec::new(),
+            },
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("set twice"), "{error}");
     }
 
     #[test]

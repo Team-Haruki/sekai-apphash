@@ -10,17 +10,18 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use tokio::runtime::Handle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use unity_rs_core::source::Region;
 
-use crate::config::{Config, RegionConfig};
+use crate::config::{Config, RegionConfig, SourceConfig, SourceKind};
 use crate::error::{Error, Result};
 use crate::extract::scan_package;
 use crate::identity::{AppIdentity, SourceInfo};
 use crate::publish::Publishers;
+use crate::qooapp;
 use crate::remote::{self, RemoteInfo};
 use crate::server::ServerRegion;
-use crate::state::StateStore;
+use crate::state::{RegionState, StateStore};
 
 /// The result of one region in one pass.
 #[derive(Debug, Clone, Serialize)]
@@ -91,8 +92,13 @@ pub struct RunOptions {
 pub struct Runner {
     config: Config,
     client: reqwest::Client,
-    /// Clients of regions whose `proxy` differs from `http.proxy`.
-    region_clients: BTreeMap<ServerRegion, reqwest::Client>,
+    /// Clients of sources whose `proxy` differs from `http.proxy`, by region
+    /// and source index.
+    source_clients: BTreeMap<(ServerRegion, usize), reqwest::Client>,
+    /// Resolved channel headers (values marked sensitive).
+    channel_headers: BTreeMap<String, HeaderMap>,
+    /// Channels with an empty required header -> the missing names.
+    unavailable_channels: BTreeMap<String, Vec<String>>,
     publishers: Publishers,
     state: StateStore,
 }
@@ -116,29 +122,111 @@ fn source_client(config: &Config, proxy: Option<&str>, what: &str) -> Result<req
     Ok(builder.build()?)
 }
 
+fn header_map<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    sensitive: bool,
+) -> Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::try_from(name)
+            .map_err(|e| Error::Config(format!("header {name:?}: {e}")))?;
+        // The value is never part of the message: it may be a credential.
+        let mut value = HeaderValue::try_from(value)
+            .map_err(|_| Error::Config(format!("header {name}: invalid value")))?;
+        value.set_sensitive(sensitive);
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+/// A source resolved to its current package.
+struct Resolved {
+    /// Change detection key, compared with the region state.
+    fingerprint: String,
+    package: Package,
+}
+
+enum Package {
+    /// Already probed (a direct source probes to get its fingerprint).
+    Probed(RemoteInfo),
+    /// Probed only when the package must be read; `display` is the URL
+    /// without its query, for reports.
+    Url { url: String, display: String },
+}
+
 impl Runner {
     pub fn new(config: Config) -> Result<Self> {
         let client = source_client(&config, config.http.proxy.as_deref(), "http.proxy")?;
-        let mut region_clients = BTreeMap::new();
-        for (region, source) in &config.regions {
-            if let Some(proxy) = source.proxy.as_deref() {
-                let what = format!("regions.{region}.proxy");
-                region_clients.insert(*region, source_client(&config, Some(proxy), &what)?);
+        let mut source_clients = BTreeMap::new();
+        for (region, region_config) in &config.regions {
+            for (index, source) in region_config.effective_sources().iter().enumerate() {
+                if let Some(proxy) = source.proxy.as_deref() {
+                    let what = format!("regions.{region}.sources[{index}].proxy");
+                    source_clients.insert(
+                        (*region, index),
+                        source_client(&config, Some(proxy), &what)?,
+                    );
+                }
             }
         }
-        let publishers = Publishers::new(&config.publish, &config.http.user_agent)?;
-        let state = StateStore::new(&config.state.dir);
-        Ok(Self {
+        let mut channel_headers = BTreeMap::new();
+        let mut unavailable_channels = BTreeMap::new();
+        for (name, channel) in &config.channels {
+            let headers = channel.resolved_headers()?;
+            channel_headers.insert(
+                name.clone(),
+                header_map(headers.iter().map(|(n, v)| (n.as_str(), v.expose())), true)
+                    .map_err(|e| Error::Config(format!("channels.{name}: {e}")))?,
+            );
+            let missing = channel.missing_required();
+            if !missing.is_empty() {
+                unavailable_channels.insert(name.clone(), missing);
+            }
+        }
+        let runner = Self {
+            publishers: Publishers::new(&config.publish, &config.http.user_agent)?,
+            state: StateStore::new(&config.state.dir),
             config,
             client,
-            region_clients,
-            publishers,
-            state,
-        })
+            source_clients,
+            channel_headers,
+            unavailable_channels,
+        };
+        runner.warn_unavailable_channels();
+        Ok(runner)
     }
 
-    fn client_for(&self, region: ServerRegion) -> &reqwest::Client {
-        self.region_clients.get(&region).unwrap_or(&self.client)
+    /// One warning per channel whose required headers are empty, naming the
+    /// enabled sources that will be skipped (never the header values).
+    fn warn_unavailable_channels(&self) {
+        for (channel, missing) in &self.unavailable_channels {
+            let sources: Vec<String> = self
+                .config
+                .enabled_regions()
+                .into_iter()
+                .flat_map(|region| {
+                    self.config.regions[&region]
+                        .effective_sources()
+                        .into_iter()
+                        .filter(|s| s.enabled && &s.channel == channel)
+                        .map(move |s| format!("{region}/{}", s.label()))
+                })
+                .collect();
+            if !sources.is_empty() {
+                warn!(
+                    %channel,
+                    missing = %missing.join(","),
+                    sources = %sources.join(","),
+                    "Channel has empty required headers; its sources are skipped until they are set"
+                );
+            }
+        }
+    }
+
+    fn client_for(&self, region: ServerRegion, index: usize) -> &reqwest::Client {
+        self.source_clients
+            .get(&(region, index))
+            .unwrap_or(&self.client)
     }
 
     #[must_use]
@@ -146,37 +234,51 @@ impl Runner {
         &self.config
     }
 
-    fn source(&self, region: ServerRegion) -> Result<&RegionConfig> {
+    fn region_config(&self, region: ServerRegion) -> Result<&RegionConfig> {
         self.config
             .regions
             .get(&region)
-            .filter(|source| !source.url.trim().is_empty())
-            .ok_or_else(|| Error::Config(format!("regions.{region}.url is not configured")))
+            .filter(|config| config.has_enabled_source())
+            .ok_or_else(|| Error::Config(format!("regions.{region} has no enabled source")))
     }
 
-    fn headers(source: &RegionConfig) -> Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        for (name, value) in &source.headers {
-            let name = HeaderName::try_from(name.as_str())
-                .map_err(|e| Error::Config(format!("header {name:?}: {e}")))?;
-            let value = HeaderValue::try_from(value.as_str())
-                .map_err(|e| Error::Config(format!("header {name}: {e}")))?;
-            headers.insert(name, value);
+    /// The channel's headers, then the source's own.
+    fn headers(&self, source: &SourceConfig) -> Result<HeaderMap> {
+        let mut headers = if source.channel.is_empty() {
+            HeaderMap::new()
+        } else {
+            self.channel_headers
+                .get(&source.channel)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Config(format!("channel {:?} is not defined", source.channel))
+                })?
+        };
+        let own = header_map(
+            source.headers.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+            false,
+        )?;
+        for (name, value) in own {
+            if let Some(name) = name {
+                headers.insert(name, value);
+            }
         }
         Ok(headers)
     }
 
-    /// Probes a remote package with the client (and proxy) of `region`.
+    /// Probes a remote package with the client (and proxy) of the region's
+    /// first source.
     pub async fn probe(
         &self,
         region: ServerRegion,
         url: &str,
         headers: &HeaderMap,
     ) -> Result<RemoteInfo> {
-        remote::probe(self.client_for(region), url, headers).await
+        remote::probe(self.client_for(region, 0), url, headers).await
     }
 
-    /// Downloads (by ranges) and parses a probed remote package.
+    /// Downloads (by ranges) and parses a probed remote package, accepting
+    /// only the region's own package name.
     pub async fn extract_remote(
         &self,
         region: ServerRegion,
@@ -184,7 +286,20 @@ impl Runner {
         info: &RemoteInfo,
         headers: HeaderMap,
     ) -> Result<AppIdentity> {
-        let client = self.client_for(region).clone();
+        let client = self.client_for(region, 0).clone();
+        self.extract_with(client, region, platform, info, headers, &[])
+            .await
+    }
+
+    async fn extract_with(
+        &self,
+        client: reqwest::Client,
+        region: ServerRegion,
+        platform: &str,
+        info: &RemoteInfo,
+        headers: HeaderMap,
+        packages: &[String],
+    ) -> Result<AppIdentity> {
         let handle = Handle::current();
         let page = self.config.http.page_size_kib.max(4) * 1024;
         let cache = self.config.http.cache_mib.max(1) * 1024 * 1024;
@@ -208,6 +323,7 @@ impl Runner {
             region,
             platform,
             scan,
+            packages,
             Some(SourceInfo::from_remote(info, Some(stats.bytes()))),
         )
     }
@@ -233,6 +349,7 @@ impl Runner {
             region,
             platform,
             scan,
+            &[],
             Some(SourceInfo {
                 location: path.display().to_string(),
                 size,
@@ -244,13 +361,161 @@ impl Runner {
         )
     }
 
-    /// Extracts `region` from its configured source, ignoring state.
+    /// Extracts `region` from the first of its sources that works, ignoring
+    /// state.
     pub async fn extract(&self, region: ServerRegion) -> Result<AppIdentity> {
-        let source = self.source(region)?;
-        let headers = Self::headers(source)?;
-        let info = self.probe(region, &source.url, &headers).await?;
-        self.extract_remote(region, &source.platform, &info, headers)
-            .await
+        let mut extracted = false;
+        self.obtain(region, true, None, &mut extracted).await
+    }
+
+    /// Finds out what `source` currently serves.
+    async fn resolve(
+        &self,
+        region: ServerRegion,
+        index: usize,
+        source: &SourceConfig,
+        headers: &HeaderMap,
+    ) -> Result<Resolved> {
+        let client = self.client_for(region, index);
+        match source.kind {
+            SourceKind::Direct => {
+                let info = remote::probe(client, &source.download_url, headers).await?;
+                Ok(Resolved {
+                    fingerprint: info.fingerprint(),
+                    package: Package::Probed(info),
+                })
+            }
+            SourceKind::Qooapp => {
+                let release =
+                    qooapp::resolve(client, &source.check_url, &source.download_url, headers)
+                        .await?;
+                debug!(
+                    %region,
+                    source = source.label(),
+                    package_id = %release.package_id,
+                    version = ?release.version_name,
+                    asset_pack = release.asset_pack,
+                    "QooApp store answered"
+                );
+                Ok(Resolved {
+                    fingerprint: release.fingerprint(),
+                    package: Package::Url {
+                        url: release.download_url,
+                        display: release.display_url,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Tries the region's sources in order and returns the first identity.
+    /// With `state`, an unchanged package reuses the cached identity and a
+    /// new one is recorded there; `force` re-extracts regardless.
+    async fn obtain(
+        &self,
+        region: ServerRegion,
+        force: bool,
+        mut state: Option<&mut RegionState>,
+        extracted: &mut bool,
+    ) -> Result<AppIdentity> {
+        let region_config = self.region_config(region)?;
+        let mut failures = Vec::new();
+        for (index, source) in region_config.effective_sources().iter().enumerate() {
+            if !source.enabled {
+                continue;
+            }
+            if let Some(missing) = self.unavailable_channels.get(&source.channel) {
+                // Warned once at startup; no request is sent.
+                debug!(%region, source = source.label(), "Skipping source: channel has empty required headers");
+                failures.push(format!(
+                    "{}: skipped (channel {} lacks {})",
+                    source.label(),
+                    source.channel,
+                    missing.join(",")
+                ));
+                continue;
+            }
+            let attempt = self
+                .obtain_from(
+                    region,
+                    index,
+                    source,
+                    &region_config.platform,
+                    force,
+                    state.as_deref_mut(),
+                    extracted,
+                )
+                .await;
+            match attempt {
+                Ok(identity) => {
+                    if !failures.is_empty() {
+                        info!(%region, source = source.label(), "Used a fallback source");
+                    }
+                    return Ok(identity);
+                }
+                Err(error) => {
+                    warn!(%region, source = source.label(), %error, "Source failed");
+                    failures.push(format!("{}: {error}", source.label()));
+                }
+            }
+        }
+        Err(Error::Other(format!(
+            "no source yielded the identity ({})",
+            failures.join("; ")
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn obtain_from(
+        &self,
+        region: ServerRegion,
+        index: usize,
+        source: &SourceConfig,
+        platform: &str,
+        force: bool,
+        state: Option<&mut RegionState>,
+        extracted: &mut bool,
+    ) -> Result<AppIdentity> {
+        let headers = self.headers(source)?;
+        let resolved = self.resolve(region, index, source, &headers).await?;
+        let cached = state
+            .as_deref()
+            .filter(|s| !force && s.fingerprint == resolved.fingerprint)
+            .and_then(|s| s.identity.clone());
+        if let Some(cached) = cached {
+            info!(%region, source = source.label(), app_version = %cached.app_version, "Package unchanged; reusing cached identity");
+            return Ok(cached);
+        }
+        let info = match resolved.package {
+            Package::Probed(info) => info,
+            Package::Url { url, display } => {
+                let mut info =
+                    remote::probe(self.client_for(region, index), &url, &headers).await?;
+                // Reports show the URL without its (possibly signed) query.
+                info.url = display;
+                info
+            }
+        };
+        let client = self.client_for(region, index).clone();
+        let identity = self
+            .extract_with(client, region, platform, &info, headers, &source.packages)
+            .await?;
+        *extracted = true;
+        if let Some(state) = state {
+            if state.identity.as_ref().map(AppIdentity::essence) != Some(identity.essence()) {
+                info!(
+                    %region,
+                    source = source.label(),
+                    app_version = %identity.app_version,
+                    app_hash = %identity.app_hash,
+                    previous = ?state.identity.as_ref().map(|i| i.app_version.clone()),
+                    "New app identity"
+                );
+            }
+            state.fingerprint = resolved.fingerprint;
+            state.identity = Some(identity.clone());
+        }
+        Ok(identity)
     }
 
     /// Checks one region: reuse the cached identity when the package is
@@ -282,35 +547,15 @@ impl Runner {
         options: RunOptions,
         report: &mut RegionReport,
     ) -> Result<()> {
-        let source = self.source(region)?;
-        let headers = Self::headers(source)?;
         let mut state = self.state.load(region).await;
-        let info = self.probe(region, &source.url, &headers).await?;
-        let fingerprint = info.fingerprint();
-        let identity = match state.identity.clone() {
-            Some(cached) if !options.force && state.fingerprint == fingerprint => {
-                info!(%region, app_version = %cached.app_version, "Package unchanged; reusing cached identity");
-                cached
-            }
-            _ => {
-                let identity = self
-                    .extract_remote(region, &source.platform, &info, headers)
-                    .await?;
-                report.extracted = true;
-                if state.identity.as_ref().map(AppIdentity::essence) != Some(identity.essence()) {
-                    info!(
-                        %region,
-                        app_version = %identity.app_version,
-                        app_hash = %identity.app_hash,
-                        previous = ?state.identity.as_ref().map(|i| i.app_version.clone()),
-                        "New app identity"
-                    );
-                }
-                state.fingerprint = fingerprint;
-                state.identity = Some(identity.clone());
-                identity
-            }
-        };
+        let identity = self
+            .obtain(
+                region,
+                options.force,
+                Some(&mut state),
+                &mut report.extracted,
+            )
+            .await?;
         if options.publish && !self.publishers.is_empty() {
             let failures = self
                 .publishers

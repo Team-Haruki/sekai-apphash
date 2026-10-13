@@ -21,7 +21,8 @@ long-running service that publishes changes to
    tail. Stored entries are addressed in place, which also opens the stored APKs inside an
    XAPK (`UnityDataAssetPack.apk`, the base APK) as nested archives.
 3. **Manifest.** The base APK's binary `AndroidManifest.xml` gives the package name,
-   `versionName` and `versionCode`. The package must belong to the requested region.
+   `versionName` and `versionCode`. The package must be the region's (or one the source lists
+   in `packages`).
 4. **Unity data.** The JP/EN builds keep the config in a small serialized file
    (`assets/bin/Data/6350e2ec327334c8a9b7f494f344a761`); the Nuverse builds pack it into
    `resources.assets` inside the LZ4 UnityFS bundle `assets/bin/Data/data.unity3d`. Only the
@@ -35,7 +36,7 @@ long-running service that publishes changes to
 ## Usage
 
 ```shell
-cp config.example.toml config.toml   # fill in the package URLs per region
+cp config.example.toml config.toml   # fill in the package sources per region
 
 # Extract now and print JSON (no state, no publishing)
 sekai-apphash -c config.toml extract
@@ -97,6 +98,55 @@ SEKAI_APPHASH_PUBLISH__WEBHOOKS__AUDIT__HMAC_SECRET=...
 
 Each region may set its own `proxy` (unset inherits `http.proxy`, `""` connects directly), for
 hosts that reach some download sources only through a proxy.
+
+### Sources and channels
+
+`regions.<r>.url` is shorthand for one source. A region can instead list `sources`, tried in
+order until one yields the identity; a disabled source is passed over, and a failing one is
+logged and the next one tried. `run` fails for the region only when every source failed.
+
+```toml
+[[regions.tw.sources]]
+name = "mirror"
+download_url = "https://downloads.example.com/tw/latest.xapk"
+
+[[regions.tw.sources]]
+name = "qooapp"
+kind = "qooapp"
+check_url = "https://store.example.com/store/v11/apps/12345"
+download_url = "https://store.example.com/v11/apps/{package_id}/download"
+channel = "qoo"
+packages = ["com.hermes.mk.asia", "com.hermes.mk.asia.qooapp"]
+# proxy = ""            # per source, like the region proxy
+
+[channels.qoo]
+required_headers = ["x-user-token"]
+[channels.qoo.headers]
+User-Agent = "Mozilla/5.0 ..."
+x-version-name = "9.1.1"
+x-user-token = ""       # from the environment, never from this file
+```
+
+- **`direct`** (default): `download_url` is the package; changes are detected from the range
+  probe as above.
+- **`qooapp`**: `check_url` is the app's QooApp v11 store entry. Its answer names the
+  `packageId`, the base APK's MD5 and the split APKs. When a `UnityDataAssetPack` split is
+  listed, that split is read; otherwise the base APK at `download_url` with `{package_id}`
+  filled in. The MD5 is the fingerprint, so an unchanged build costs one API request.
+- **`packages`**: the Android package names the source may serve for the region. Empty means
+  the region's own package only (e.g. `com.hermes.mk.asia` for TW); store builds such as
+  QooApp's `com.hermes.mk.asia.qooapp` must be listed. Another region's package is always
+  refused.
+- **Channels** are named header sets. Every value is treated as a credential: it is never
+  logged or printed. `_` in a header name reads as `-`, so the environment can set them:
+  `SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN=...`. Put tokens there (for example in a
+  root-only `EnvironmentFile`), not in the config file. While a header listed in
+  `required_headers` is empty, the channel's sources are skipped without any request, with one
+  warning per run. `Accept-Encoding`, `Connection`, `Keep-Alive`, `Host`, `Range` and
+  `Content-Length` are left to the HTTP client.
+
+Switching to another source re-reads the package once, since each source has its own
+fingerprint.
 
 Tokens and secrets are never logged or printed (`Debug` shows `<redacted>`).
 
