@@ -209,8 +209,14 @@ pub struct HarukiPublisherConfig {
     pub token: Secret,
     /// Regions to push; empty means every region that was extracted.
     pub regions: Vec<ServerRegion>,
-    /// Refuse to push a version older than the node's current one.
+    /// Refuse to push a version older than the node's current one. The
+    /// node's identity must then be readable and comparable, or nothing is
+    /// pushed.
     pub refuse_downgrade: bool,
+    /// Regions the node has no app identity for yet (its version file has an
+    /// empty `appVersion`): the first identity may be pushed there without
+    /// the downgrade check. Remove the region once it is bootstrapped.
+    pub bootstrap_regions: Vec<ServerRegion>,
     pub timeout_secs: u64,
 }
 
@@ -222,6 +228,7 @@ impl Default for HarukiPublisherConfig {
             token: Secret::default(),
             regions: Vec::new(),
             refuse_downgrade: true,
+            bootstrap_regions: Vec::new(),
             timeout_secs: 20,
         }
     }

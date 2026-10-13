@@ -59,13 +59,17 @@ url = "https://downloads.example.com/cn/latest.apk"
 # Haruki-Sekai-API: POST {base_url}/internal/app-identity with the node's
 # backend.internal_token. The node's current identity is read first
 # (GET /internal/master/{region}/version): nothing is sent when it already
-# matches, and older versions are refused.
+# matches, and older versions are refused. When it cannot be read, nothing is
+# sent and the run fails.
 [publish.haruki]
 enabled = false
 base_url = "http://127.0.0.1:9999"
 # token = ""            # use SEKAI_APPHASH_PUBLISH__HARUKI__TOKEN instead
 regions = []            # [] = every region checked in the pass
 refuse_downgrade = true
+# Regions whose version file has an empty appVersion (a brand-new region):
+# allow the first push there. Remove the region once it is bootstrapped.
+bootstrap_regions = []
 timeout_secs = 20
 
 # Write identities as JSON (only when they change).

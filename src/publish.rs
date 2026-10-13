@@ -156,14 +156,23 @@ fn in_filter(filter: &[ServerRegion], region: ServerRegion) -> bool {
     filter.is_empty() || filter.contains(&region)
 }
 
-/// The identity fields of a node's version file.
+/// The identity fields of a node's version file. `appVersion` must be
+/// present: a body without it is not a version file. An empty `appVersion`
+/// means the node has no identity for the region yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeIdentity {
-    #[serde(default)]
     pub app_version: String,
     #[serde(default)]
     pub app_hash: String,
+}
+
+impl NodeIdentity {
+    /// The node reports no app version (a fresh version file).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.app_version.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,7 +201,11 @@ impl HarukiPublisher {
     }
 
     /// The identity the node currently logs in with, from
-    /// `GET /internal/master/{region}/version`.
+    /// `GET /internal/master/{region}/version`. Only a version file is an
+    /// answer (an empty `appVersion` in it means "none yet"). A transport
+    /// error, a non-200 status (404: internal endpoints disabled) or an
+    /// `{ok: false}` envelope (no or unreadable version file, region not
+    /// configured; the node's `POST` would refuse those too) is an error.
     pub async fn current(&self, region: ServerRegion) -> Result<NodeIdentity> {
         let response = self
             .client
@@ -219,34 +232,60 @@ impl HarukiPublisher {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// Whether `expected` may be pushed over the node's `current` identity.
+    /// An empty node identity passes only for a region listed in
+    /// `bootstrap_regions`. Otherwise, with `refuse_downgrade`, an older or
+    /// incomparable version is refused.
+    fn check_current(
+        &self,
+        region: ServerRegion,
+        current: &NodeIdentity,
+        expected: &str,
+    ) -> Result<()> {
+        if current.is_empty() {
+            if self.config.bootstrap_regions.contains(&region) {
+                warn!(%region, app_version = %expected, "Node has no app identity yet; bootstrapping this region");
+                return Ok(());
+            }
+            return Err(Error::Publish(format!(
+                "not publishing: the node has no app identity for {region} yet; \
+                 list it in publish.haruki.bootstrap_regions to push the first one"
+            )));
+        }
+        if !self.config.refuse_downgrade {
+            return Ok(());
+        }
+        match compare_versions(expected, &current.app_version) {
+            Some(std::cmp::Ordering::Less) => Err(Error::Publish(format!(
+                "refusing downgrade {} -> {expected}",
+                current.app_version
+            ))),
+            Some(_) => Ok(()),
+            None => Err(Error::Publish(format!(
+                "not publishing: cannot compare the node's app version {:?} with {expected:?}",
+                current.app_version
+            ))),
+        }
+    }
+
     pub async fn publish(&self, identity: &AppIdentity, force: bool) -> Result<Outcome> {
         let region = identity.region;
         if !in_filter(&self.config.regions, region) {
             return Ok(Outcome::Skipped);
         }
         let expected = server_app_version(region, &identity.app_version);
-        match self.current(region).await {
-            Ok(current) => {
-                if !force
-                    && current.app_version == expected
-                    && current.app_hash == identity.app_hash
-                {
-                    return Ok(Outcome::Unchanged);
-                }
-                if self.config.refuse_downgrade
-                    && compare_versions(&expected, &current.app_version)
-                        == Some(std::cmp::Ordering::Less)
-                {
-                    return Err(Error::Publish(format!(
-                        "refusing downgrade {} -> {expected}",
-                        current.app_version
-                    )));
-                }
-            }
-            Err(error) => {
-                warn!(%region, %error, "Cannot read the node's current identity; pushing without the downgrade check")
-            }
+        // Fail closed: without the node's current identity neither the
+        // "already there" nor the downgrade check can run, so nothing is sent.
+        // The error is logged by `Publishers::publish` and fails the run.
+        let current = self.current(region).await.map_err(|error| {
+            Error::Publish(format!(
+                "not publishing: cannot read the node's current identity ({error})"
+            ))
+        })?;
+        if !force && current.app_version == expected && current.app_hash == identity.app_hash {
+            return Ok(Outcome::Unchanged);
         }
+        self.check_current(region, &current, &expected)?;
         let response = self
             .client
             .post(self.url("/internal/app-identity"))

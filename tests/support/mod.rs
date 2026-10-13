@@ -92,6 +92,8 @@ pub struct MockNode {
     pub versions: Arc<Mutex<std::collections::BTreeMap<String, (String, String)>>>,
     pub posts: Arc<Mutex<Vec<Value>>>,
     pub auth_headers: Arc<Mutex<Vec<String>>>,
+    /// When set, `GET .../version` answers this bare status instead.
+    pub version_status: Arc<Mutex<Option<StatusCode>>>,
 }
 
 impl MockNode {
@@ -149,6 +151,9 @@ async fn node_version(
     if !node.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    if let Some(status) = *node.version_status.lock().unwrap() {
+        return status.into_response();
+    }
     let versions = node.versions.lock().unwrap();
     match versions.get(&server) {
         Some((version, hash)) => Json(json!({
@@ -156,8 +161,12 @@ async fn node_version(
             "assetVersion": "1.0.0.1", "assetHash": "", "cdnVersion": 0
         }))
         .into_response(),
-        None => Json(json!({"ok": false, "kind": "not_found", "message": "unknown region"}))
-            .into_response(),
+        // What the node answers when the version file is missing.
+        None => Json(json!({
+            "ok": false, "kind": "io",
+            "message": "version file: No such file or directory (os error 2)"
+        }))
+        .into_response(),
     }
 }
 
