@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+
+# Local configuration and runtime data
+/config.toml
+/state/
+/out/
+*.apk
+*.xapk
+*.ipa
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,57 @@
+[package]
+name = "sekai-apphash"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+authors = ["Haruki Dev Team"]
+description = "Extract the Project SEKAI app identity (app version, app hash, data version) from published game packages"
+license = "MIT"
+repository = "https://github.com/Team-Haruki/sekai-apphash"
+readme = "README.md"
+keywords = ["unity", "apk", "project-sekai"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "sekai_apphash"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sekai-apphash"
+path = "src/main.rs"
+
+[dependencies]
+# Unity parsing. Pinned exactly: the bundle/serialized-file APIs used here are
+# still moving between minor releases.
+unity-rs-core = "=0.6.0"
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "net"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "http2"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.9"
+mimalloc = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["process"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+tempfile = "3"
+figment = { version = "0.10", features = ["toml", "env", "test"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
