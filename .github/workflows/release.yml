@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: # dry run: builds everything, publishes nothing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate
+    permissions:
+      contents: read
+      checks: read
+    uses: seiunx-dev/ci-templates/.github/workflows/release-gate.yml@v1
+
+  binaries:
+    name: Binaries
+    needs: gate
+    uses: seiunx-dev/ci-templates/.github/workflows/rust-release.yml@v1
+    with:
+      version: ${{ needs.gate.outputs.version }}
+      tag: ${{ needs.gate.outputs.tag }}
+      bins: sekai-apphash
+      extra-files: |
+        config.example.toml
+        LICENSE
+      asset-name: "{name}-{label}"
+
+  docker:
+    name: Docker
+    needs: gate
+    if: needs.gate.outputs.is-tag == 'true' # dry runs never push images
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: read
+    uses: seiunx-dev/ci-templates/.github/workflows/docker.yml@v1
+    with:
+      promote-on-tag: true # re-tag the verified main image; the gate already waited for it
+      cache-backend: registry
+
+  publish:
+    name: GitHub Release
+    needs: [gate, binaries, docker]
+    if: needs.gate.outputs.is-tag == 'true'
+    permissions:
+      contents: write
+    uses: seiunx-dev/ci-templates/.github/workflows/gh-release.yml@v1
+    with:
+      tag: ${{ needs.gate.outputs.tag }}
+      prerelease: ${{ needs.gate.outputs.prerelease }}

@@ -1,0 +1,13 @@
+.git
+.github
+target
+state
+out
+config.toml
+*.apk
+*.xapk
+*.ipa
+tests
+README.md
+AGENTS.md
+CLAUDE.md
