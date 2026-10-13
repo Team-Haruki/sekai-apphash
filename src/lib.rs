@@ -18,6 +18,7 @@ pub mod identity;
 pub mod logging;
 pub mod player_settings;
 pub mod publish;
+pub mod qooapp;
 pub mod remote;
 pub mod runner;
 pub mod server;

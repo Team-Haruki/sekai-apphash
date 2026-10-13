@@ -482,6 +482,66 @@ pub struct Fixture {
 /// configs among unrelated MonoBehaviours and other objects.
 #[must_use]
 pub fn xapk(package: &str, version: (&str, &str, &str), app_hash: &str) -> Fixture {
+    let (bundle, production) = nuverse_bundle(package, version, app_hash);
+    let base = zip_archive(&[
+        (
+            "AndroidManifest.xml",
+            &base_manifest(package, &format!("{}.{}.0", version.0, version.1), 4242),
+            true,
+        ),
+        ("classes.dex", b"dex\n035\0", true),
+    ]);
+    let pack = zip_archive(&[
+        (
+            "AndroidManifest.xml",
+            &manifest(
+                &[Attr {
+                    name: "package",
+                    resource_id: None,
+                    value: AttrValue::Text(package),
+                }],
+                true,
+            ),
+            true,
+        ),
+        ("assets/bin/Data/data.unity3d", &bundle, false),
+    ]);
+    let bytes = zip_archive(&[
+        ("manifest.json", b"{}", true),
+        (&format!("{package}.apk"), &base, false),
+        ("UnityDataAssetPack.apk", &pack, false),
+        (
+            "config.arm64_v8a.apk",
+            &zip_archive(&[("lib/arm64-v8a/x.so", b"elf", true)]),
+            false,
+        ),
+    ]);
+    Fixture { bytes, production }
+}
+
+/// A single APK shaped like a QooApp base APK of a Nuverse build: the
+/// manifest and `assets/bin/Data/data.unity3d` in one archive.
+#[must_use]
+pub fn apk(package: &str, version: (&str, &str, &str), app_hash: &str) -> Fixture {
+    let (bundle, production) = nuverse_bundle(package, version, app_hash);
+    let bytes = zip_archive(&[
+        (
+            "AndroidManifest.xml",
+            &base_manifest(package, &format!("{}.{}.0", version.0, version.1), 21901),
+            true,
+        ),
+        ("classes.dex", b"dex\n035\0", true),
+        ("assets/bin/Data/data.unity3d", &bundle, false),
+    ]);
+    Fixture { bytes, production }
+}
+
+/// The `data.unity3d` of a Nuverse build and the production config in it.
+fn nuverse_bundle(
+    package: &str,
+    version: (&str, &str, &str),
+    app_hash: &str,
+) -> (Vec<u8>, PlayerSettings) {
     let mut production = sample("production_android", version, app_hash);
     production.bundle_identifier = package.to_owned();
     let staging = sample(
@@ -542,38 +602,5 @@ pub fn xapk(package: &str, version: (&str, &str, &str), app_hash: &str) -> Fixtu
         ],
         4096,
     );
-    let base = zip_archive(&[
-        (
-            "AndroidManifest.xml",
-            &base_manifest(package, &format!("{}.{}.0", version.0, version.1), 4242),
-            true,
-        ),
-        ("classes.dex", b"dex\n035\0", true),
-    ]);
-    let pack = zip_archive(&[
-        (
-            "AndroidManifest.xml",
-            &manifest(
-                &[Attr {
-                    name: "package",
-                    resource_id: None,
-                    value: AttrValue::Text(package),
-                }],
-                true,
-            ),
-            true,
-        ),
-        ("assets/bin/Data/data.unity3d", &bundle, false),
-    ]);
-    let bytes = zip_archive(&[
-        ("manifest.json", b"{}", true),
-        (&format!("{package}.apk"), &base, false),
-        ("UnityDataAssetPack.apk", &pack, false),
-        (
-            "config.arm64_v8a.apk",
-            &zip_archive(&[("lib/arm64-v8a/x.so", b"elf", true)]),
-            false,
-        ),
-    ]);
-    Fixture { bytes, production }
+    (bundle, production)
 }

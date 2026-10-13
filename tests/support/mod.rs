@@ -208,3 +208,106 @@ impl HookReceiver {
         spawn(app).await
     }
 }
+
+/// One app as the mock QooApp store reports it.
+#[derive(Clone, Debug)]
+pub struct QooApp {
+    pub package_id: String,
+    pub version_name: String,
+    pub md5: String,
+    /// When set, listed as the `UnityDataAssetPack` split at this URL.
+    pub asset_pack_url: Option<String>,
+}
+
+/// A stand-in for the QooApp v11 store API and its download endpoint, which
+/// redirects to `package_url`.
+#[derive(Clone, Default)]
+pub struct QooStore {
+    pub token: String,
+    /// app id -> app
+    pub apps: Arc<Mutex<std::collections::BTreeMap<String, QooApp>>>,
+    pub package_url: Arc<Mutex<String>>,
+    pub store_requests: Arc<AtomicUsize>,
+    pub downloads: Arc<AtomicUsize>,
+    /// Headers of every store and download request.
+    pub seen: Arc<Mutex<Vec<HeaderMap>>>,
+}
+
+impl QooStore {
+    pub fn new(token: &str, package_url: String) -> Self {
+        Self {
+            token: token.into(),
+            package_url: Arc::new(Mutex::new(package_url)),
+            ..Self::default()
+        }
+    }
+
+    pub fn set(&self, app_id: &str, app: QooApp) {
+        self.apps.lock().unwrap().insert(app_id.into(), app);
+    }
+
+    pub async fn start(&self) -> SocketAddr {
+        let app = Router::new()
+            .route("/store/v11/apps/{id}", get(qoo_app))
+            .route("/v11/apps/{package}/download", get(qoo_download))
+            .with_state(self.clone());
+        spawn(app).await
+    }
+
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        self.seen.lock().unwrap().push(headers.clone());
+        headers.get("x-user-token").and_then(|v| v.to_str().ok()) == Some(self.token.as_str())
+    }
+}
+
+async fn qoo_app(
+    State(store): State<QooStore>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    store.store_requests.fetch_add(1, Ordering::SeqCst);
+    if !store.authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code": 401, "message": "login required"})),
+        )
+            .into_response();
+    }
+    let Some(app) = store.apps.lock().unwrap().get(&id).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let splits: Vec<Value> = app
+        .asset_pack_url
+        .iter()
+        .map(|url| json!({"url": url, "md5": format!("{}-pack", app.md5)}))
+        .chain(std::iter::once(
+            json!({"url": "https://cdn.example.invalid/config.arm64_v8a.apk", "md5": "abi"}),
+        ))
+        .collect();
+    Json(json!({
+        "code": 0,
+        "data": {
+            "id": id,
+            "packageId": app.package_id,
+            "apk": {"versionName": app.version_name, "versionCode": 21901, "baseApkMd5": app.md5},
+            "splitApks": splits,
+        }
+    }))
+    .into_response()
+}
+
+async fn qoo_download(
+    State(store): State<QooStore>,
+    Path(package): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    store.downloads.fetch_add(1, Ordering::SeqCst);
+    if !store.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let target = format!(
+        "{}?package={package}&sig=signed",
+        store.package_url.lock().unwrap()
+    );
+    (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+}

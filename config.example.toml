@@ -45,8 +45,31 @@ url = "https://downloads.example.com/jp/latest.xapk"
 [regions.en]
 url = "https://downloads.example.com/en/latest.xapk"
 
+# A region can instead list `sources`, tried in order until one yields the
+# identity (an unusable source is logged and the next one is tried):
+#   kind = "direct"   download_url is the package itself (what `url` means)
+#   kind = "qooapp"   check_url is a QooApp v11 store API entry
+#                     (.../store/v11/apps/<app id>); the package is
+#                     download_url with {package_id} filled in, or the
+#                     UnityDataAssetPack split the API lists. The MD5 the API
+#                     reports detects new builds without downloading.
+# Each source may set enabled, name, channel (a [channels.*] header set),
+# headers, proxy and packages (Android package names accepted for the region;
+# default: the region's own, e.g. QooApp serves TW as com.hermes.mk.asia.qooapp).
+# `url` and `sources` are not combined.
 [regions.tw]
-url = "https://downloads.example.com/tw/latest.xapk"
+[[regions.tw.sources]]
+name = "mirror"
+download_url = "https://downloads.example.com/tw/latest.xapk"
+
+[[regions.tw.sources]]
+name = "qooapp"
+enabled = false
+kind = "qooapp"
+check_url = "https://store.example.com/store/v11/apps/12345"
+download_url = "https://store.example.com/v11/apps/{package_id}/download"
+channel = "qoo"
+packages = ["com.hermes.mk.asia", "com.hermes.mk.asia.qooapp"]
 
 [regions.kr]
 url = "https://downloads.example.com/kr/latest.xapk"
@@ -55,6 +78,27 @@ url = "https://downloads.example.com/kr/latest.xapk"
 url = "https://downloads.example.com/cn/latest.apk"
 # proxy = ""            # e.g. reach this source directly while the others use http.proxy
 # enabled = false
+
+# Request header sets for sources (`channel = "..."`). Values are treated as
+# credentials and never logged; `_` in a name reads as `-`. Keep tokens out of
+# this file and set them from the environment instead, e.g.
+#   SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN=...
+# While a header in required_headers is empty, the channel's sources are
+# skipped without a request (one warning per run). Accept-Encoding,
+# Connection, Keep-Alive, Host, Range and Content-Length are managed by the
+# client and ignored here.
+[channels.qoo]
+required_headers = ["x-user-token"]
+
+[channels.qoo.headers]
+Accept = "*/*"
+User-Agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+x-version-code = "90101"
+x-version-name = "9.1.1"
+x-device-abis = ""
+x-device-id = ""        # from the environment if the account needs it
+x-device-uuid = ""
+x-user-token = ""       # SEKAI_APPHASH_CHANNELS__QOO__HEADERS__X_USER_TOKEN
 
 # Haruki-Sekai-API: POST {base_url}/internal/app-identity with the node's
 # backend.internal_token. The node's current identity is read first
