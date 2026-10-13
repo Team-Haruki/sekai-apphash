@@ -311,8 +311,12 @@ async fn an_empty_node_identity_needs_an_explicit_bootstrap() {
     assert!(error.contains("bootstrap_regions"), "{error}");
     assert!(h.node.posts.lock().unwrap().is_empty());
 
-    // Listing another region does not help.
+    // Neither does turning the downgrade guard off, nor listing another region.
     let mut config = h.config.clone();
+    config.publish.haruki.as_mut().unwrap().refuse_downgrade = false;
+    let error = haruki_failure(&config).await;
+    assert!(error.contains("bootstrap_regions"), "{error}");
+    config.publish.haruki.as_mut().unwrap().refuse_downgrade = true;
     config.publish.haruki.as_mut().unwrap().bootstrap_regions = vec![ServerRegion::Kr];
     haruki_failure(&config).await;
     assert!(h.node.posts.lock().unwrap().is_empty());

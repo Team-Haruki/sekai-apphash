@@ -232,10 +232,11 @@ impl HarukiPublisher {
         Ok(serde_json::from_value(value)?)
     }
 
-    /// Whether pushing `expected` over `current` passes the downgrade guard.
+    /// Whether `expected` may be pushed over the node's `current` identity.
     /// An empty node identity passes only for a region listed in
-    /// `bootstrap_regions`; a version that cannot be compared never passes.
-    fn check_downgrade(
+    /// `bootstrap_regions`. Otherwise, with `refuse_downgrade`, an older or
+    /// incomparable version is refused.
+    fn check_current(
         &self,
         region: ServerRegion,
         current: &NodeIdentity,
@@ -250,6 +251,9 @@ impl HarukiPublisher {
                 "not publishing: the node has no app identity for {region} yet; \
                  list it in publish.haruki.bootstrap_regions to push the first one"
             )));
+        }
+        if !self.config.refuse_downgrade {
+            return Ok(());
         }
         match compare_versions(expected, &current.app_version) {
             Some(std::cmp::Ordering::Less) => Err(Error::Publish(format!(
@@ -281,9 +285,7 @@ impl HarukiPublisher {
         if !force && current.app_version == expected && current.app_hash == identity.app_hash {
             return Ok(Outcome::Unchanged);
         }
-        if self.config.refuse_downgrade {
-            self.check_downgrade(region, &current, &expected)?;
-        }
+        self.check_current(region, &current, &expected)?;
         let response = self
             .client
             .post(self.url("/internal/app-identity"))
