@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -416,4 +416,18 @@ pub fn sign(secret: &str, body: &[u8]) -> String {
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sign;
+
+    #[test]
+    fn sign_matches_rfc4231() {
+        // RFC 4231 test case 2 (HMAC-SHA-256).
+        assert_eq!(
+            sign("Jefe", b"what do ya want for nothing?"),
+            "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
 }

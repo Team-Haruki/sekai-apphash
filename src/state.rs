@@ -129,5 +129,8 @@ mod tests {
         assert_eq!(digest(b"abc"), digest(b"abc"));
         assert_ne!(digest(b"abc"), digest(b"abd"));
         assert_eq!(digest(b"").len(), 32);
+        // Known answer: the first 16 bytes of SHA-256("abc"). Delivered
+        // digests are persisted, so a crate bump must not change them.
+        assert_eq!(digest(b"abc"), "ba7816bf8f01cfea414140de5dae2223");
     }
 }
