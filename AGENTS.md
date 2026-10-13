@@ -69,7 +69,11 @@ tests/
   <backend.internal_token>` and `{server, appVersion, appHash}`; the node answers HTTP 200 with
   an envelope `{ok, data: {changed, appVersion, appHash}}` or `{ok: false, kind, message}`, 401
   for a wrong token and 404 when its internal endpoints are disabled.
-  `GET /internal/master/{region}/version` returns the version file (`appVersion`, `appHash`, ...).
+  `GET /internal/master/{region}/version` returns the version file (`appVersion`, `appHash`, ...)
+  with HTTP 200, or an `{ok: false}` envelope (missing/unreadable version file, region not
+  configured). The publisher fails closed: anything but a version file means "could not read"
+  and nothing is pushed. An empty `appVersion` means "no identity yet" and is pushed only for
+  regions in `publish.haruki.bootstrap_regions`.
 - **Caching.** `state/<region>.json` keeps the source fingerprint (size, ETag, Last-Modified,
   redirect path without query) and the identity. Unchanged fingerprint = no download.
   File/webhook deliveries are skipped when the stable digest (identity without timestamps and

@@ -5,6 +5,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
+use axum::http::StatusCode;
 use sekai_apphash::config::{
     Config, FilePublisherConfig, HarukiPublisherConfig, RegionConfig, Secret, StateConfig,
     WebhookConfig,
@@ -236,6 +237,173 @@ async fn downgrades_are_refused() {
         .await
         .remove(0);
     assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+}
+
+/// Runs one publishing pass for TW and returns the Haruki publisher's error.
+async fn haruki_failure(config: &Config) -> String {
+    let runner = Runner::new(config.clone()).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(!report.is_ok(), "{report:?}");
+    assert_eq!(report.publish_errors.len(), 1, "{report:?}");
+    report.publish_errors[0].clone()
+}
+
+#[tokio::test]
+async fn an_unreadable_node_identity_blocks_the_push() {
+    let h = harness(TOKEN).await;
+
+    // No version file on the node: `{ok: false}` envelope.
+    let error = haruki_failure(&h.config).await;
+    assert!(error.starts_with("haruki"), "{error}");
+    assert!(
+        error.contains("cannot read the node's current identity"),
+        "{error}"
+    );
+    assert!(error.contains("No such file"), "{error}");
+
+    // A 5xx, and the bare 404 of a node with its internal endpoints disabled.
+    for status in [StatusCode::SERVICE_UNAVAILABLE, StatusCode::NOT_FOUND] {
+        *h.node.version_status.lock().unwrap() = Some(status);
+        let error = haruki_failure(&h.config).await;
+        assert!(error.contains(&format!("HTTP {status}")), "{error}");
+    }
+
+    // Bootstrapping does not cover an unreadable node either.
+    let mut config = h.config.clone();
+    config.publish.haruki.as_mut().unwrap().bootstrap_regions = vec![ServerRegion::Tw];
+    let error = haruki_failure(&config).await;
+    assert!(error.contains("cannot read"), "{error}");
+    assert!(h.node.posts.lock().unwrap().is_empty());
+
+    // Nothing listening at all.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_addr = closed.local_addr().unwrap();
+    drop(closed);
+    config.publish.haruki.as_mut().unwrap().base_url = format!("http://{closed_addr}");
+    let error = haruki_failure(&config).await;
+    assert!(error.contains("cannot read"), "{error}");
+
+    // The other publishers still ran on the first pass.
+    assert_eq!(h.hooks.deliveries.lock().unwrap().len(), 1);
+
+    // Once the node answers, the push goes through.
+    *h.node.version_status.lock().unwrap() = None;
+    h.node.set("tw", "6.3.0", "old-hash");
+    let runner = Runner::new(h.config.clone()).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_empty_node_identity_needs_an_explicit_bootstrap() {
+    let h = harness(TOKEN).await;
+    h.node.set("tw", "", "");
+    let error = haruki_failure(&h.config).await;
+    assert!(error.contains("bootstrap_regions"), "{error}");
+    assert!(h.node.posts.lock().unwrap().is_empty());
+
+    // Listing another region does not help.
+    let mut config = h.config.clone();
+    config.publish.haruki.as_mut().unwrap().bootstrap_regions = vec![ServerRegion::Kr];
+    haruki_failure(&config).await;
+    assert!(h.node.posts.lock().unwrap().is_empty());
+
+    config.publish.haruki.as_mut().unwrap().bootstrap_regions = vec![ServerRegion::Tw];
+    let runner = Runner::new(config).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+    assert_eq!(
+        h.node.versions.lock().unwrap()["tw"],
+        ("6.4.0".to_owned(), TW_HASH.to_owned())
+    );
+
+    // Bootstrapped: the normal checks apply again, even with the list kept.
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+    h.node.set("tw", "6.5.0", "newer-hash");
+    let mut config = h.config.clone();
+    config.publish.haruki.as_mut().unwrap().bootstrap_regions = vec![ServerRegion::Tw];
+    let error = haruki_failure(&config).await;
+    assert!(error.contains("refusing downgrade"), "{error}");
+}
+
+#[tokio::test]
+async fn an_incomparable_node_version_blocks_the_push() {
+    let h = harness(TOKEN).await;
+    h.node.set("tw", "unknown", "some-hash");
+    let error = haruki_failure(&h.config).await;
+    assert!(error.contains("cannot compare"), "{error}");
+    assert!(h.node.posts.lock().unwrap().is_empty());
+
+    // Without the downgrade guard there is nothing to compare.
+    let mut config = h.config.clone();
+    config.publish.haruki.as_mut().unwrap().refuse_downgrade = false;
+    let runner = Runner::new(config).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_cli_run_fails_when_the_node_identity_is_unreadable() {
+    let h = harness(TOKEN).await;
+    let haruki = h.config.publish.haruki.as_ref().unwrap();
+    let config = format!(
+        "[state]\ndir = {state:?}\n\n[regions.tw]\nurl = {url:?}\n\n\
+         [publish.haruki]\nbase_url = {base:?}\n",
+        state = h.out.path().join("cli-state"),
+        url = h.config.regions[&ServerRegion::Tw].url,
+        base = haruki.base_url,
+    );
+    let path = h.out.path().join("config.toml");
+    std::fs::write(&path, config).unwrap();
+    let run = || async {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_sekai-apphash"))
+            .args(["run", "tw", "--compact", "--config"])
+            .arg(&path)
+            .env("SEKAI_APPHASH_PUBLISH__HARUKI__TOKEN", TOKEN)
+            .output()
+            .await
+            .unwrap()
+    };
+
+    let failed = run().await;
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("cannot read the node's current identity"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(TOKEN));
+    assert!(h.node.posts.lock().unwrap().is_empty());
+
+    h.node.set("tw", "6.3.0", "old-hash");
+    let ok = run().await;
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
     assert_eq!(h.node.posts.lock().unwrap().len(), 1);
 }
 

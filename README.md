@@ -106,7 +106,17 @@ Tokens and secrets are never logged or printed (`Debug` shows `<redacted>`).
   `{"server", "appVersion", "appHash"}`. The node's current identity is read first from
   `GET /internal/master/{region}/version`: nothing is sent when it already matches (after the
   node's Nuverse normalization), and an older version is refused unless
-  `refuse_downgrade = false`.
+  `refuse_downgrade = false`. The publisher fails closed: when that read fails (network error,
+  non-200 status such as the 404 of a node without `internal_token`, or an `{ok: false}`
+  envelope such as a missing version file) nothing is sent and the region counts as failed, so
+  `run` exits non-zero. With `refuse_downgrade` on, a node version that cannot be compared is
+  refused the same way.
+- **Bootstrapping a new region.** A node whose version file exists but has an empty
+  `appVersion` has no identity to protect yet. The publisher still refuses it unless the region
+  is listed in `bootstrap_regions` (e.g. `bootstrap_regions = ["kr"]`); the first identity is
+  then pushed without the downgrade check. Once the node holds an identity, the normal checks
+  apply again; remove the region from the list afterwards. A missing version file cannot be
+  bootstrapped this way: the node refuses the `POST` as well, so create the file first.
 - **file** — one JSON object keyed by region (`path`) and/or one `<region>.json` per region
   (`dir`), rewritten atomically when an identity changes.
 - **webhooks** — `POST {"event":"app-identity","region":...,"identity":{...}}` when an identity
