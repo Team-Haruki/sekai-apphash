@@ -91,31 +91,54 @@ pub struct RunOptions {
 pub struct Runner {
     config: Config,
     client: reqwest::Client,
+    /// Clients of regions whose `proxy` differs from `http.proxy`.
+    region_clients: BTreeMap<ServerRegion, reqwest::Client>,
     publishers: Publishers,
     state: StateStore,
 }
 
-impl Runner {
-    pub fn new(config: Config) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .user_agent(&config.http.user_agent)
-            .connect_timeout(Duration::from_secs(config.http.connect_timeout_secs.max(1)))
-            .timeout(Duration::from_secs(config.http.timeout_secs.max(1)));
-        if let Some(proxy) = config.http.proxy.as_deref().filter(|p| !p.is_empty()) {
+/// Builds a source client. `proxy`: `None` = no explicit proxy, `Some("")` =
+/// direct (also ignoring proxy environment variables), otherwise that proxy.
+fn source_client(config: &Config, proxy: Option<&str>, what: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(&config.http.user_agent)
+        .connect_timeout(Duration::from_secs(config.http.connect_timeout_secs.max(1)))
+        .timeout(Duration::from_secs(config.http.timeout_secs.max(1)));
+    match proxy.map(str::trim) {
+        Some("") => builder = builder.no_proxy(),
+        Some(proxy) => {
             builder = builder.proxy(
-                reqwest::Proxy::all(proxy)
-                    .map_err(|e| Error::Config(format!("http.proxy: {e}")))?,
+                reqwest::Proxy::all(proxy).map_err(|e| Error::Config(format!("{what}: {e}")))?,
             );
         }
-        let client = builder.build()?;
+        None => {}
+    }
+    Ok(builder.build()?)
+}
+
+impl Runner {
+    pub fn new(config: Config) -> Result<Self> {
+        let client = source_client(&config, config.http.proxy.as_deref(), "http.proxy")?;
+        let mut region_clients = BTreeMap::new();
+        for (region, source) in &config.regions {
+            if let Some(proxy) = source.proxy.as_deref() {
+                let what = format!("regions.{region}.proxy");
+                region_clients.insert(*region, source_client(&config, Some(proxy), &what)?);
+            }
+        }
         let publishers = Publishers::new(&config.publish, &config.http.user_agent)?;
         let state = StateStore::new(&config.state.dir);
         Ok(Self {
             config,
             client,
+            region_clients,
             publishers,
             state,
         })
+    }
+
+    fn client_for(&self, region: ServerRegion) -> &reqwest::Client {
+        self.region_clients.get(&region).unwrap_or(&self.client)
     }
 
     #[must_use]
@@ -143,9 +166,14 @@ impl Runner {
         Ok(headers)
     }
 
-    /// Probes a remote package.
-    pub async fn probe(&self, url: &str, headers: &HeaderMap) -> Result<RemoteInfo> {
-        remote::probe(&self.client, url, headers).await
+    /// Probes a remote package with the client (and proxy) of `region`.
+    pub async fn probe(
+        &self,
+        region: ServerRegion,
+        url: &str,
+        headers: &HeaderMap,
+    ) -> Result<RemoteInfo> {
+        remote::probe(self.client_for(region), url, headers).await
     }
 
     /// Downloads (by ranges) and parses a probed remote package.
@@ -156,7 +184,7 @@ impl Runner {
         info: &RemoteInfo,
         headers: HeaderMap,
     ) -> Result<AppIdentity> {
-        let client = self.client.clone();
+        let client = self.client_for(region).clone();
         let handle = Handle::current();
         let page = self.config.http.page_size_kib.max(4) * 1024;
         let cache = self.config.http.cache_mib.max(1) * 1024 * 1024;
@@ -220,7 +248,7 @@ impl Runner {
     pub async fn extract(&self, region: ServerRegion) -> Result<AppIdentity> {
         let source = self.source(region)?;
         let headers = Self::headers(source)?;
-        let info = self.probe(&source.url, &headers).await?;
+        let info = self.probe(region, &source.url, &headers).await?;
         self.extract_remote(region, &source.platform, &info, headers)
             .await
     }
@@ -257,7 +285,7 @@ impl Runner {
         let source = self.source(region)?;
         let headers = Self::headers(source)?;
         let mut state = self.state.load(region).await;
-        let info = self.probe(&source.url, &headers).await?;
+        let info = self.probe(region, &source.url, &headers).await?;
         let fingerprint = info.fingerprint();
         let identity = match state.identity.clone() {
             Some(cached) if !options.force && state.fingerprint == fingerprint => {

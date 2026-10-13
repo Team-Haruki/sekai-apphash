@@ -40,6 +40,7 @@ listen = ""
 url = "https://downloads.example.com/jp/latest.xapk"
 # platform = "android"  # which production config to report: android | ios
 # headers = { Referer = "https://downloads.example.com/" }
+# proxy = "http://127.0.0.1:7890"  # this source only; "" = direct; unset = http.proxy
 
 [regions.en]
 url = "https://downloads.example.com/en/latest.xapk"
@@ -52,6 +53,7 @@ url = "https://downloads.example.com/kr/latest.xapk"
 
 [regions.cn]
 url = "https://downloads.example.com/cn/latest.apk"
+# proxy = ""            # e.g. reach this source directly while the others use http.proxy
 # enabled = false
 
 # Haruki-Sekai-API: POST {base_url}/internal/app-identity with the node's

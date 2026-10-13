@@ -95,6 +95,9 @@ SEKAI_APPHASH_PUBLISH__HARUKI__TOKEN=...
 SEKAI_APPHASH_PUBLISH__WEBHOOKS__AUDIT__HMAC_SECRET=...
 ```
 
+Each region may set its own `proxy` (unset inherits `http.proxy`, `""` connects directly), for
+hosts that reach some download sources only through a proxy.
+
 Tokens and secrets are never logged or printed (`Debug` shows `<redacted>`).
 
 ### Publishers

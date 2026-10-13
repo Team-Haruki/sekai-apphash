@@ -302,3 +302,28 @@ async fn the_cli_extracts_a_local_package() {
         .unwrap()
         .contains("belongs to kr"));
 }
+
+#[tokio::test]
+async fn a_region_proxy_overrides_the_global_one() {
+    let fixture = xapk("com.hermes.mk.asia", ("6", "4", "1"), TW_HASH);
+    let server = PackageServer::new(fixture.bytes);
+    let addr = server.start().await;
+    // Nothing listens on port 9: every request through this proxy fails.
+    let dead_proxy = "http://127.0.0.1:9".to_owned();
+
+    let mut config = config_for(format!("http://{addr}/pkg"));
+    config.http.proxy = Some(dead_proxy.clone());
+    config.http.connect_timeout_secs = 2;
+    let runner = Runner::new(config.clone()).unwrap();
+    assert!(runner.extract(ServerRegion::Tw).await.is_err());
+
+    config.regions.get_mut(&ServerRegion::Tw).unwrap().proxy = Some(String::new());
+    let runner = Runner::new(config.clone()).unwrap();
+    let identity = runner.extract(ServerRegion::Tw).await.unwrap();
+    assert_eq!(identity.app_hash, TW_HASH);
+
+    config.http.proxy = None;
+    config.regions.get_mut(&ServerRegion::Tw).unwrap().proxy = Some(dead_proxy);
+    let runner = Runner::new(config).unwrap();
+    assert!(runner.extract(ServerRegion::Tw).await.is_err());
+}

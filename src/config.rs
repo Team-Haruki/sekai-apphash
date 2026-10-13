@@ -173,6 +173,9 @@ pub struct RegionConfig {
     pub headers: BTreeMap<String, String>,
     /// Which production config to report: `android` or `ios`.
     pub platform: String,
+    /// Proxy for this source only: unset inherits `http.proxy`, `""` connects
+    /// directly, anything else is a proxy URL.
+    pub proxy: Option<String>,
 }
 
 impl Default for RegionConfig {
@@ -182,6 +185,7 @@ impl Default for RegionConfig {
             url: String::new(),
             headers: BTreeMap::new(),
             platform: "android".into(),
+            proxy: None,
         }
     }
 }

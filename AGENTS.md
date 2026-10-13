@@ -34,7 +34,8 @@ src/
   config.rs          – TOML + SEKAI_APPHASH_* env overrides (figment), Secret type
   state.rs           – Per-region state (fingerprint, identity, delivery digests)
   publish.rs         – Haruki / file / webhook publishers
-  runner.rs          – One pass: probe -> reuse cache or extract -> publish
+  runner.rs          – One pass: probe -> reuse cache or extract -> publish; source
+                       HTTP clients (global and per-region proxy)
   service.rs         – Scheduler with jitter, read-only status endpoints (axum)
   logging.rs         – tracing to stderr, text or JSON
   testing.rs         – Synthetic fixture builders (doc-hidden; used by all tests)

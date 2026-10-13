@@ -146,7 +146,7 @@ async fn extract(args: ExtractArgs, config: Config) -> anyhow::Result<ExitCode> 
         let result = if let Some(path) = &args.file {
             Runner::extract_file(region, &args.platform, path).await
         } else if let Some(url) = &args.url {
-            match runner.probe(url, &Default::default()).await {
+            match runner.probe(region, url, &Default::default()).await {
                 Ok(info) => {
                     runner
                         .extract_remote(region, &args.platform, &info, Default::default())
