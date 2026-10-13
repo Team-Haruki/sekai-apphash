@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{error, info};
