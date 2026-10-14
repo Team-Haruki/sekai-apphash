@@ -6,7 +6,8 @@ sekai-apphash extracts the app identity (app version, app hash and the rest of t
 `PlayerSettingConfig`) of Project Sekai's JP, EN, TW, KR and CN builds from published game
 packages, reading them with HTTP range requests and parsing the Unity data with `unity-rs`.
 It is a library, a CLI (`extract`, `run`, `serve`) and a long-running scheduler that publishes
-changes to Haruki-Sekai-API (`POST /internal/app-identity`), JSON files and webhooks.
+changes to Haruki-Sekai-API (`POST /internal/app-identity`), JSON files, webhooks and Haruki
+Sekai Asset Updaters (`PUT /v2/regions/{region}/app-version`, Unity version only).
 
 This repository is **public**: never commit infrastructure details (hostnames, IPs, ports of
 real deployments, server paths), real download endpoints, or tokens. Examples use
@@ -34,7 +35,7 @@ src/
                        version comparison, upgrade of identities cached by 0.2.x
   config.rs          – TOML + SEKAI_APPHASH_* env overrides (figment), Secret type
   state.rs           – Per-region state (fingerprint, identity, delivery digests)
-  publish.rs         – Haruki / file / webhook publishers
+  publish.rs         – Haruki / file / webhook / asset-updater publishers
   qooapp.rs          – QooApp v11 store API answer -> package URL + MD5 fingerprint
   runner.rs          – One pass: per region, try the sources in order (resolve ->
                        reuse cache or extract), then publish; source HTTP clients
@@ -83,6 +84,11 @@ tests/
   configured). The publisher fails closed: anything but a version file means "could not read"
   and nothing is pushed. An empty `appVersion` means "no identity yet" and is pushed only for
   regions in `publish.haruki.bootstrap_regions`.
+- **Asset updaters.** `publish.asset_updaters.<name>` PUTs `{"unity_version"}` to
+  `/v2/regions/{region}/app-version` with the instance's bearer token and `user_agent`. Never
+  send `app_version` there: the updater follows the master registry for it and probes the CDN
+  before adopting one. The delivered digest covers region + Unity version only, so an appHash
+  change does not repeat the push; a failure is not recorded and is retried next pass.
 - **Sources.** `regions.<r>.url` is one `direct` source; `regions.<r>.sources` lists several,
   tried in order. A `qooapp` source asks the store API first and uses its MD5 as the
   fingerprint. Channel header values are credentials (`config::Secret`, sensitive

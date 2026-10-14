@@ -381,6 +381,7 @@ pub struct PublishConfig {
     pub haruki: Option<HarukiPublisherConfig>,
     pub file: Option<FilePublisherConfig>,
     pub webhooks: BTreeMap<String, WebhookConfig>,
+    pub asset_updaters: BTreeMap<String, AssetUpdaterConfig>,
 }
 
 /// Haruki-Sekai-API `POST /internal/app-identity`.
@@ -469,6 +470,39 @@ impl Default for WebhookConfig {
     }
 }
 
+/// A Haruki Sekai Asset Updater: `PUT {url}/v2/regions/{region}/app-version`
+/// with `{"unity_version": ...}` when a region's Unity version changes. The
+/// app version is never sent; the updater follows the master registry for it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AssetUpdaterConfig {
+    pub enabled: bool,
+    /// Base URL of the updater, e.g. `http://127.0.0.1:8080`.
+    pub url: String,
+    /// The updater's `server.auth.bearer_token`, sent as
+    /// `Authorization: Bearer <token>` when set.
+    pub token: Secret,
+    /// Sent as `User-Agent`; must start with the updater's
+    /// `server.auth.user_agent_prefix` when it has one.
+    pub user_agent: String,
+    /// Regions to push; empty means every region that was checked.
+    pub regions: Vec<ServerRegion>,
+    pub timeout_secs: u64,
+}
+
+impl Default for AssetUpdaterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: String::new(),
+            token: Secret::default(),
+            user_agent: concat!("sekai-apphash/", env!("CARGO_PKG_VERSION")).to_owned(),
+            regions: Vec::new(),
+            timeout_secs: 20,
+        }
+    }
+}
+
 impl Config {
     /// Loads `path` (optional when it does not exist) and applies environment
     /// overrides.
@@ -529,6 +563,13 @@ impl Config {
             if hook.enabled && hook.url.trim().is_empty() {
                 return Err(Error::Config(format!(
                     "publish.webhooks.{name}.url is required"
+                )));
+            }
+        }
+        for (name, updater) in &self.publish.asset_updaters {
+            if updater.enabled && updater.url.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "publish.asset_updaters.{name}.url is required"
                 )));
             }
         }
@@ -674,10 +715,17 @@ url = "https://example.invalid/hook"
     fn the_example_config_is_valid() {
         figment::Jail::expect_with(|jail| {
             jail.create_file("example.toml", include_str!("../config.example.toml"))?;
+            jail.set_env(
+                "SEKAI_APPHASH_PUBLISH__ASSET_UPDATERS__EXAMPLE__TOKEN",
+                "updater-token",
+            );
             let config = Config::load(Some(Path::new("example.toml"))).expect("example loads");
             assert_eq!(config.enabled_regions(), ServerRegion::ALL.to_vec());
             assert!(config.publish.haruki.is_some_and(|h| !h.enabled));
             assert!(config.publish.webhooks.contains_key("example"));
+            let updater = &config.publish.asset_updaters["example"];
+            assert!(!updater.enabled);
+            assert_eq!(updater.token.expose(), "updater-token");
             Ok(())
         });
     }

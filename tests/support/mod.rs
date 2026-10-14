@@ -318,3 +318,53 @@ async fn qoo_download(
     );
     (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
 }
+
+/// A stand-in for a Haruki Sekai Asset Updater's
+/// `PUT /v2/regions/{region}/app-version`: records every request and keeps the
+/// Unity version per region. `fail_with` makes it answer that status instead.
+#[derive(Clone, Default)]
+pub struct MockUpdater {
+    /// (region, headers, body) of every PUT.
+    pub puts: Arc<Mutex<Vec<(String, HeaderMap, Value)>>>,
+    pub unity: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    pub fail_with: Arc<Mutex<Option<StatusCode>>>,
+}
+
+impl MockUpdater {
+    pub async fn start(&self) -> SocketAddr {
+        let app = Router::new()
+            .route(
+                "/v2/regions/{region}/app-version",
+                axum::routing::put(updater_put),
+            )
+            .with_state(self.clone());
+        spawn(app).await
+    }
+}
+
+async fn updater_put(
+    State(updater): State<MockUpdater>,
+    Path(region): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    updater
+        .puts
+        .lock()
+        .unwrap()
+        .push((region.clone(), headers, body.clone()));
+    if let Some(status) = *updater.fail_with.lock().unwrap() {
+        return (status, Json(json!({"message": "mock failure"}))).into_response();
+    }
+    let unity = body["unity_version"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let previous = updater.unity.lock().unwrap().insert(region, unity.clone());
+    let message = if previous.as_deref() == Some(unity.as_str()) {
+        "unchanged".to_owned()
+    } else {
+        format!("unity_version -> {unity}")
+    };
+    Json(json!({"message": message, "region": {}})).into_response()
+}
