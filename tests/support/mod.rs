@@ -328,6 +328,8 @@ pub struct MockUpdater {
     pub puts: Arc<Mutex<Vec<(String, HeaderMap, Value)>>>,
     pub unity: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
     pub fail_with: Arc<Mutex<Option<StatusCode>>>,
+    /// Answer `200` with this raw body instead of the updater's JSON.
+    pub raw_reply: Arc<Mutex<Option<(StatusCode, &'static str)>>>,
 }
 
 impl MockUpdater {
@@ -353,6 +355,9 @@ async fn updater_put(
         .lock()
         .unwrap()
         .push((region.clone(), headers, body.clone()));
+    if let Some((status, body)) = *updater.raw_reply.lock().unwrap() {
+        return (status, body).into_response();
+    }
     if let Some(status) = *updater.fail_with.lock().unwrap() {
         return (status, Json(json!({"message": "mock failure"}))).into_response();
     }

@@ -709,8 +709,24 @@ async fn a_failing_asset_updater_never_blocks_haruki_and_is_retried() {
         assert!(report.publish_errors[0].contains(expected), "{report:?}");
     }
 
-    // A failed push is not recorded, so the next pass retries it.
+    // A 2xx that is not the updater's acknowledgement, or a redirect, is a
+    // failure too.
     *updater.fail_with.lock().unwrap() = None;
+    for (status, body) in [
+        (StatusCode::OK, "<html>login</html>"),
+        (StatusCode::OK, r#"{"message":"ok"}"#),
+        (StatusCode::TEMPORARY_REDIRECT, ""),
+    ] {
+        *updater.raw_reply.lock().unwrap() = Some((status, body));
+        let report = runner
+            .run_once(&[ServerRegion::Tw], PUBLISH)
+            .await
+            .remove(0);
+        assert_eq!(report.publish_errors.len(), 1, "{status}: {report:?}");
+    }
+    *updater.raw_reply.lock().unwrap() = None;
+
+    // A failed push is not recorded, so the next pass retries it.
     let report = runner
         .run_once(&[ServerRegion::Tw], PUBLISH)
         .await

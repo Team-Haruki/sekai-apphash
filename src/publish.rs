@@ -82,9 +82,12 @@ impl Publishers {
             .map(|(name, c)| {
                 Ok(AssetUpdaterPublisher {
                     name: format!("asset-updater:{name}"),
+                    // The PUT carries the token: never resend it to wherever
+                    // a redirect points; a 3xx is a failed delivery.
                     client: reqwest::Client::builder()
                         .user_agent(&c.user_agent)
                         .timeout(Duration::from_secs(c.timeout_secs.max(1)))
+                        .redirect(reqwest::redirect::Policy::none())
                         .build()?,
                     config: c.clone(),
                 })
@@ -494,12 +497,19 @@ impl AssetUpdaterPublisher {
         }
         let response = request.send().await?;
         let status = response.status();
-        let message = response
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
-            .unwrap_or_default();
+        let body = response.json::<serde_json::Value>().await.ok();
+        let message = body
+            .as_ref()
+            .and_then(|body| body.get("message")?.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        // Only the updater's own answer counts as delivered: a 2xx from
+        // something else in front of it (a login page, a proxy) must not stop
+        // the retries.
+        let acknowledged = !message.is_empty()
+            && body
+                .as_ref()
+                .is_some_and(|body| body.get("region").is_some_and(serde_json::Value::is_object));
         match status {
             StatusCode::UNAUTHORIZED => Err(Error::Publish(
                 "updater rejected the token or user agent (HTTP 401)".into(),
@@ -510,6 +520,9 @@ impl AssetUpdaterPublisher {
             ))),
             status if !status.is_success() => Err(Error::Publish(format!(
                 "updater answered HTTP {status}: {message}"
+            ))),
+            _ if !acknowledged => Err(Error::Publish(format!(
+                "updater answered HTTP {status} without a region acknowledgement"
             ))),
             _ if message == "unchanged" => Ok(Outcome::Unchanged),
             _ => Ok(Outcome::Delivered),
