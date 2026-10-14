@@ -7,14 +7,14 @@ use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
 use sekai_apphash::config::{
-    Config, FilePublisherConfig, HarukiPublisherConfig, RegionConfig, Secret, StateConfig,
-    WebhookConfig,
+    AssetUpdaterConfig, Config, FilePublisherConfig, HarukiPublisherConfig, RegionConfig, Secret,
+    StateConfig, WebhookConfig,
 };
 use sekai_apphash::publish::{sign, SIGNATURE_HEADER};
 use sekai_apphash::runner::{RunOptions, Runner};
 use sekai_apphash::testing::{xapk, xapk_with_manifest, Fixture};
 use sekai_apphash::ServerRegion;
-use support::{HookReceiver, MockNode, PackageServer};
+use support::{HookReceiver, MockNode, MockUpdater, PackageServer};
 
 const TW_HASH: &str = "d67a688b-ff78-4300-bfc5-2120c000d75d";
 const TOKEN: &str = "test-internal-token";
@@ -615,4 +615,161 @@ async fn a_region_proxy_overrides_the_global_one() {
     config.regions.get_mut(&ServerRegion::Tw).unwrap().proxy = Some(dead_proxy);
     let runner = Runner::new(config).unwrap();
     assert!(runner.extract(ServerRegion::Tw).await.is_err());
+}
+
+/// The harness config plus one asset updater; returns the updater and a
+/// runner for that config.
+async fn with_updater(h: &Harness, regions: Vec<ServerRegion>) -> (MockUpdater, Runner) {
+    let updater = MockUpdater::default();
+    let addr = updater.start().await;
+    let mut config = h.config.clone();
+    config.publish.asset_updaters = BTreeMap::from([(
+        "cn".to_owned(),
+        AssetUpdaterConfig {
+            url: format!("http://{addr}/"),
+            token: Secret::new("updater-token"),
+            user_agent: "HarukiInternal/apphash".to_owned(),
+            regions,
+            ..AssetUpdaterConfig::default()
+        },
+    )]);
+    config.validate().unwrap();
+    (updater, Runner::new(config).unwrap())
+}
+
+#[tokio::test]
+async fn asset_updaters_get_the_unity_version_once_per_change() {
+    let h = harness(TOKEN).await;
+    h.node.set("tw", "6.3.0", "old-hash");
+    let (updater, runner) = with_updater(&h, Vec::new()).await;
+
+    let first = runner.run_once(&[ServerRegion::Tw], PUBLISH).await;
+    assert!(first[0].is_ok(), "{:?}", first[0]);
+    {
+        let puts = updater.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        let (region, headers, body) = &puts[0];
+        assert_eq!(region, "tw");
+        assert_eq!(body, &serde_json::json!({"unity_version": "2022.3.62f1"}));
+        assert_eq!(headers["authorization"], "Bearer updater-token");
+        assert_eq!(headers["user-agent"], "HarukiInternal/apphash");
+    }
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+
+    // Unchanged Unity version: nothing is sent again.
+    let second = runner.run_once(&[ServerRegion::Tw], PUBLISH).await;
+    assert!(second[0].is_ok(), "{:?}", second[0]);
+    assert_eq!(updater.puts.lock().unwrap().len(), 1);
+
+    // --force re-sends; the updater reports it unchanged.
+    let forced = runner
+        .run_once(
+            &[ServerRegion::Tw],
+            RunOptions {
+                force: true,
+                publish: true,
+            },
+        )
+        .await;
+    assert!(forced[0].is_ok(), "{:?}", forced[0]);
+    assert_eq!(updater.puts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_failing_asset_updater_never_blocks_haruki_and_is_retried() {
+    let h = harness(TOKEN).await;
+    h.node.set("tw", "6.3.0", "old-hash");
+    let (updater, runner) = with_updater(&h, Vec::new()).await;
+    *updater.fail_with.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
+
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.error.is_none());
+    assert_eq!(report.publish_errors.len(), 1, "{report:?}");
+    assert!(report.publish_errors[0].starts_with("asset-updater:cn: "));
+    assert!(report.publish_errors[0].contains("mock failure"));
+    assert_eq!(
+        h.node.posts.lock().unwrap().len(),
+        1,
+        "Haruki still published"
+    );
+    assert_eq!(h.hooks.deliveries.lock().unwrap().len(), 1);
+
+    for (status, expected) in [
+        (StatusCode::UNAUTHORIZED, "HTTP 401"),
+        (StatusCode::NOT_FOUND, "404"),
+    ] {
+        *updater.fail_with.lock().unwrap() = Some(status);
+        let report = runner
+            .run_once(&[ServerRegion::Tw], PUBLISH)
+            .await
+            .remove(0);
+        assert!(report.publish_errors[0].contains(expected), "{report:?}");
+    }
+
+    // A 2xx that is not the updater's acknowledgement, or a redirect, is a
+    // failure too.
+    *updater.fail_with.lock().unwrap() = None;
+    for (status, body) in [
+        (StatusCode::OK, "<html>login</html>"),
+        (StatusCode::OK, r#"{"message":"ok"}"#),
+        (StatusCode::TEMPORARY_REDIRECT, ""),
+    ] {
+        *updater.raw_reply.lock().unwrap() = Some((status, body));
+        let report = runner
+            .run_once(&[ServerRegion::Tw], PUBLISH)
+            .await
+            .remove(0);
+        assert_eq!(report.publish_errors.len(), 1, "{status}: {report:?}");
+    }
+    *updater.raw_reply.lock().unwrap() = None;
+
+    // A failed push is not recorded, so the next pass retries it.
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(updater.unity.lock().unwrap()["tw"], "2022.3.62f1");
+    let puts = updater.puts.lock().unwrap().len();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(updater.puts.lock().unwrap().len(), puts);
+}
+
+#[tokio::test]
+async fn asset_updaters_skip_regions_outside_their_filter() {
+    let h = harness(TOKEN).await;
+    h.node.set("tw", "6.3.0", "old-hash");
+    let (updater, runner) = with_updater(&h, vec![ServerRegion::Cn]).await;
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert!(updater.puts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_enabled_asset_updater_needs_a_url() {
+    let mut config = Config::default();
+    config
+        .publish
+        .asset_updaters
+        .insert("cn".to_owned(), AssetUpdaterConfig::default());
+    let error = config.validate().unwrap_err();
+    assert!(
+        error.to_string().contains("publish.asset_updaters.cn.url"),
+        "{error}"
+    );
+    config.publish.asset_updaters.get_mut("cn").unwrap().enabled = false;
+    config.validate().unwrap();
+    assert!(AssetUpdaterConfig::default()
+        .user_agent
+        .starts_with("sekai-apphash/"));
 }

@@ -1,4 +1,5 @@
-//! Delivers identities: Haruki-Sekai-API, JSON files, and webhooks.
+//! Delivers identities: Haruki-Sekai-API, JSON files, webhooks, and the Unity
+//! version to Haruki Sekai Asset Updaters.
 
 use std::path::Path;
 use std::time::Duration;
@@ -11,7 +12,9 @@ use serde_json::json;
 use sha2::Sha256;
 use tracing::{info, warn};
 
-use crate::config::{FilePublisherConfig, HarukiPublisherConfig, PublishConfig, WebhookConfig};
+use crate::config::{
+    AssetUpdaterConfig, FilePublisherConfig, HarukiPublisherConfig, PublishConfig, WebhookConfig,
+};
 use crate::error::{Error, Result};
 use crate::identity::{compare_versions, AppIdentity};
 use crate::server::ServerRegion;
@@ -36,6 +39,7 @@ pub struct Publishers {
     haruki: Option<HarukiPublisher>,
     file: Option<FilePublisher>,
     webhooks: Vec<WebhookPublisher>,
+    asset_updaters: Vec<AssetUpdaterPublisher>,
 }
 
 impl Publishers {
@@ -71,16 +75,38 @@ impl Publishers {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let asset_updaters = config
+            .asset_updaters
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(name, c)| {
+                Ok(AssetUpdaterPublisher {
+                    name: format!("asset-updater:{name}"),
+                    // The PUT carries the token: never resend it to wherever
+                    // a redirect points; a 3xx is a failed delivery.
+                    client: reqwest::Client::builder()
+                        .user_agent(&c.user_agent)
+                        .timeout(Duration::from_secs(c.timeout_secs.max(1)))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()?,
+                    config: c.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             haruki,
             file,
             webhooks,
+            asset_updaters,
         })
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.haruki.is_none() && self.file.is_none() && self.webhooks.is_empty()
+        self.haruki.is_none()
+            && self.file.is_none()
+            && self.webhooks.is_empty()
+            && self.asset_updaters.is_empty()
     }
 
     /// Runs every publisher for `identity`. `delivered` maps publisher names to
@@ -98,14 +124,15 @@ impl Publishers {
         let mut record =
             |name: &str,
              result: Result<Outcome>,
+             digest: &str,
              delivered: &mut std::collections::BTreeMap<String, String>| {
                 match result {
                     Ok(Outcome::Delivered) => {
                         info!(region = %identity.region, publisher = name, app_version = %identity.app_version, "Published app identity");
-                        delivered.insert(name.to_owned(), stable.clone());
+                        delivered.insert(name.to_owned(), digest.to_owned());
                     }
                     Ok(Outcome::Unchanged) => {
-                        delivered.insert(name.to_owned(), stable.clone());
+                        delivered.insert(name.to_owned(), digest.to_owned());
                     }
                     Ok(Outcome::Skipped) => {}
                     Err(error) => {
@@ -116,7 +143,7 @@ impl Publishers {
             };
         if let Some(haruki) = &self.haruki {
             let result = haruki.publish(identity, force).await;
-            record("haruki", result, delivered);
+            record("haruki", result, &stable, delivered);
         }
         if let Some(file) = &self.file {
             let unchanged = !force && delivered.get("file") == Some(&stable);
@@ -125,7 +152,7 @@ impl Publishers {
             } else {
                 file.publish(identity).await
             };
-            record("file", result, delivered);
+            record("file", result, &stable, delivered);
         }
         for hook in &self.webhooks {
             let unchanged = !force && delivered.get(&hook.name) == Some(&stable);
@@ -134,7 +161,20 @@ impl Publishers {
             } else {
                 hook.publish(identity).await
             };
-            record(&hook.name, result, delivered);
+            record(&hook.name, result, &stable, delivered);
+        }
+        // Updaters only care about the Unity version, so they are compared on
+        // that alone: a new appHash does not repeat the push.
+        if let Some(unity) = unity_digest(identity) {
+            for updater in &self.asset_updaters {
+                let unchanged = !force && delivered.get(&updater.name) == Some(&unity);
+                let result = if unchanged {
+                    Ok(Outcome::Unchanged)
+                } else {
+                    updater.publish(identity).await
+                };
+                record(&updater.name, result, &unity, delivered);
+            }
         }
         failures
     }
@@ -150,6 +190,13 @@ pub fn stable_digest(identity: &AppIdentity) -> String {
         source.bytes_fetched = None;
     }
     digest(&serde_json::to_vec(&stable).unwrap_or_default())
+}
+
+/// Digest of what an asset updater receives (region and Unity version);
+/// `None` when the identity has no Unity version.
+fn unity_digest(identity: &AppIdentity) -> Option<String> {
+    let unity = identity.unity_version.as_deref()?.trim();
+    (!unity.is_empty()).then(|| digest(format!("{}\0{unity}", identity.region).as_bytes()))
 }
 
 fn in_filter(filter: &[ServerRegion], region: ServerRegion) -> bool {
@@ -409,6 +456,77 @@ impl WebhookPublisher {
             return Err(Error::Publish(format!("webhook answered HTTP {status}")));
         }
         Ok(Outcome::Delivered)
+    }
+}
+
+pub struct AssetUpdaterPublisher {
+    name: String,
+    client: reqwest::Client,
+    config: AssetUpdaterConfig,
+}
+
+impl AssetUpdaterPublisher {
+    /// `PUT /v2/regions/{region}/app-version` with the Unity version only. The
+    /// updater answers `{"message": "unchanged", ...}` when it already had it.
+    pub async fn publish(&self, identity: &AppIdentity) -> Result<Outcome> {
+        let region = identity.region;
+        if !in_filter(&self.config.regions, region) {
+            return Ok(Outcome::Skipped);
+        }
+        let Some(unity_version) = identity
+            .unity_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            return Ok(Outcome::Skipped);
+        };
+        let url = format!(
+            "{}/v2/regions/{region}/app-version",
+            self.config.url.trim_end_matches('/')
+        );
+        let mut request = self
+            .client
+            .put(url)
+            .json(&json!({ "unity_version": unity_version }));
+        if !self.config.token.is_empty() {
+            request = request.header(
+                AUTHORIZATION,
+                format!("Bearer {}", self.config.token.expose()),
+            );
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.json::<serde_json::Value>().await.ok();
+        let message = body
+            .as_ref()
+            .and_then(|body| body.get("message")?.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        // Only the updater's own answer counts as delivered: a 2xx from
+        // something else in front of it (a login page, a proxy) must not stop
+        // the retries.
+        let acknowledged = !message.is_empty()
+            && body
+                .as_ref()
+                .is_some_and(|body| body.get("region").is_some_and(serde_json::Value::is_object));
+        match status {
+            StatusCode::UNAUTHORIZED => Err(Error::Publish(
+                "updater rejected the token or user agent (HTTP 401)".into(),
+            )),
+            StatusCode::NOT_FOUND => Err(Error::Publish(format!(
+                "updater answered 404 (region not configured there, or an updater \
+                 without /v2/regions): {message}"
+            ))),
+            status if !status.is_success() => Err(Error::Publish(format!(
+                "updater answered HTTP {status}: {message}"
+            ))),
+            _ if !acknowledged => Err(Error::Publish(format!(
+                "updater answered HTTP {status} without a region acknowledgement"
+            ))),
+            _ if message == "unchanged" => Ok(Outcome::Unchanged),
+            _ => Ok(Outcome::Delivered),
+        }
     }
 }
 

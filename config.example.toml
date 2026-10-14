@@ -116,6 +116,18 @@ refuse_downgrade = true
 bootstrap_regions = []
 timeout_secs = 20
 
+# Haruki Sekai Asset Updater instances: PUT {url}/v2/regions/{region}/app-version
+# with {"unity_version": ...} when a region's Unity version changes (the app
+# version is never sent). A failed push is retried on the next pass and never
+# blocks the other publishers.
+[publish.asset_updaters.example]
+enabled = false
+url = "http://127.0.0.1:8080"
+# token = ""            # SEKAI_APPHASH_PUBLISH__ASSET_UPDATERS__EXAMPLE__TOKEN
+user_agent = "HarukiInternal/sekai-apphash"   # must match the updater's user_agent_prefix
+regions = []            # [] = every region checked in the pass
+timeout_secs = 20
+
 # Write identities as JSON (only when they change).
 [publish.file]
 enabled = false

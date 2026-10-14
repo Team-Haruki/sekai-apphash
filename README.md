@@ -10,7 +10,8 @@ It reads packages with HTTP range requests, so a 500 MB XAPK costs about 2 MB (J
 (TW/KR/CN) of downloads instead of a full copy, and parses the Unity data with
 [unity-rs](https://github.com/seiunx-dev/unity-rs). It is a library, a CLI, and an optional
 long-running service that publishes changes to
-[Haruki Sekai API](https://github.com/Team-Haruki/Haruki-Sekai-API), JSON files or webhooks.
+[Haruki Sekai API](https://github.com/Team-Haruki/Haruki-Sekai-API), JSON files, webhooks and
+[Haruki Sekai Asset Updater](https://github.com/Team-Haruki/Haruki-Sekai-Asset-Updater) instances.
 
 ## How it works
 
@@ -186,6 +187,15 @@ Tokens and secrets are never logged or printed (`Debug` shows `<redacted>`).
 - **webhooks** — `POST {"event":"app-identity","region":...,"identity":{...}}` when an identity
   changes, with optional `Authorization: Bearer` and an
   `X-Sekai-Apphash-Signature: sha256=<HMAC-SHA256 of the body>` header.
+
+- **asset_updaters** — for each configured Haruki Sekai Asset Updater,
+  `PUT {url}/v2/regions/{region}/app-version` with `{"unity_version": ...}` only (the updater
+  follows the master registry for the app version, so `appVersion` is never sent), with
+  `Authorization: Bearer <token>` and the configured `User-Agent` (it must start with the
+  updater's `server.auth.user_agent_prefix`). Only a change of the region's Unity version is
+  pushed; a failed push is not recorded and is retried on the next pass. Requires an updater
+  with the `/v2/regions` API (7.3.0 or later); an older one answers 404. Limit an instance to
+  the regions it serves with `regions`.
 
 A failing publisher does not stop the others; `run` exits non-zero and `serve` reports it.
 
