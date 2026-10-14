@@ -51,17 +51,23 @@ impl StateStore {
     }
 
     /// Loads a region's state; a missing or unreadable file is an empty state.
+    /// A cached identity from an older version is upgraded in memory (see
+    /// [`AppIdentity::upgrade_cached`]).
     pub async fn load(&self, region: ServerRegion) -> RegionState {
         let Some(path) = self.path(region) else {
             return RegionState::default();
         };
-        match tokio::fs::read(&path).await {
+        let mut state: RegionState = match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
                 tracing::warn!(%region, %error, "Ignoring unreadable state file");
                 RegionState::default()
             }),
             Err(_) => RegionState::default(),
+        };
+        if let Some(identity) = state.identity.as_mut() {
+            identity.upgrade_cached();
         }
+        state
     }
 
     pub async fn save(&self, region: ServerRegion, state: &RegionState) -> Result<()> {

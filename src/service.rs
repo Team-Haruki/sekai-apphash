@@ -141,6 +141,7 @@ async fn health(State(status): State<Shared>) -> Response {
                 json!({
                     "ok": report.is_ok(),
                     "appVersion": report.identity.as_ref().map(|i| &i.app_version),
+                    "clientVersion": report.identity.as_ref().map(|i| &i.client_version),
                     "checkedAt": report.checked_at,
                     "error": report.error,
                     "publishErrors": report.publish_errors,

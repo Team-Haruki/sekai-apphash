@@ -133,7 +133,8 @@ async fn a_qooapp_source_resolves_through_the_store_api() {
     assert!(report.is_ok(), "{report:?}");
     assert!(report.extracted);
     let identity = report.identity.as_ref().unwrap();
-    assert_eq!(identity.app_version, "6.4.1");
+    assert_eq!(identity.app_version, "6.4.0");
+    assert_eq!(identity.client_version, "6.4.1");
     assert_eq!(identity.app_hash, TW_HASH);
     let manifest = identity.manifest.as_ref().unwrap();
     assert_eq!(manifest.package, TW_QOO);

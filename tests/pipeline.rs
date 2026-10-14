@@ -12,7 +12,7 @@ use sekai_apphash::config::{
 };
 use sekai_apphash::publish::{sign, SIGNATURE_HEADER};
 use sekai_apphash::runner::{RunOptions, Runner};
-use sekai_apphash::testing::xapk;
+use sekai_apphash::testing::{xapk, xapk_with_manifest, Fixture};
 use sekai_apphash::ServerRegion;
 use support::{HookReceiver, MockNode, PackageServer};
 
@@ -45,7 +45,9 @@ async fn extracts_through_redirects_with_range_requests() {
     let runner = Runner::new(config_for(format!("http://{addr}/latest"))).unwrap();
 
     let identity = runner.extract(ServerRegion::Tw).await.unwrap();
-    assert_eq!(identity.app_version, "6.4.1");
+    // TW logs in with the manifest version; the config's version is kept.
+    assert_eq!(identity.app_version, "6.4.0");
+    assert_eq!(identity.client_version, "6.4.1");
     assert_eq!(identity.app_hash, TW_HASH);
     assert_eq!(identity.ab_version, "6.4.0");
     assert_eq!(identity.config, "production_android");
@@ -92,7 +94,14 @@ struct Harness {
 }
 
 async fn harness(node_token: &str) -> Harness {
-    let fixture = xapk("com.hermes.mk.asia", ("6", "4", "1"), TW_HASH);
+    harness_with(
+        node_token,
+        xapk("com.hermes.mk.asia", ("6", "4", "1"), TW_HASH),
+    )
+    .await
+}
+
+async fn harness_with(node_token: &str, fixture: Fixture) -> Harness {
     let server = PackageServer::new(fixture.bytes);
     let addr = server.start().await;
     let node = MockNode::new(node_token);
@@ -148,7 +157,7 @@ async fn a_run_publishes_once_and_then_reuses_the_cache() {
     let posts = h.node.posts.lock().unwrap().clone();
     assert_eq!(posts.len(), 1);
     assert_eq!(posts[0]["server"], "tw");
-    assert_eq!(posts[0]["appVersion"], "6.4.1");
+    assert_eq!(posts[0]["appVersion"], "6.4.0");
     assert_eq!(posts[0]["appHash"], TW_HASH);
     assert_eq!(
         h.node.versions.lock().unwrap()["tw"],
@@ -161,7 +170,9 @@ async fn a_run_publishes_once_and_then_reuses_the_cache() {
     let single: serde_json::Value =
         serde_json::from_slice(&std::fs::read(h.out.path().join("regions/tw.json")).unwrap())
             .unwrap();
-    assert_eq!(single["appVersion"], "6.4.1");
+    assert_eq!(single["appVersion"], "6.4.0");
+    assert_eq!(single["appVersionSource"], "manifest");
+    assert_eq!(single["clientVersion"], "6.4.1");
 
     {
         let deliveries = h.hooks.deliveries.lock().unwrap();
@@ -237,6 +248,112 @@ async fn downgrades_are_refused() {
         .await
         .remove(0);
     assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_nuverse_patch_release_is_published_with_its_manifest_version() {
+    let fixture = xapk_with_manifest(
+        "com.hermes.mk.asia",
+        ("6", "4", "2"),
+        Some("6.4.1"),
+        TW_HASH,
+    );
+    let h = harness_with(TOKEN, fixture).await;
+    h.node
+        .keep_patch
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.node.set("tw", "6.4.0", "old-hash");
+    let runner = Runner::new(h.config.clone()).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    let identity = report.identity.unwrap();
+    assert_eq!(identity.app_version, "6.4.1");
+    assert_eq!(identity.client_version, "6.4.2");
+    let posts = h.node.posts.lock().unwrap().clone();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["appVersion"], "6.4.1");
+    assert_eq!(
+        h.node.versions.lock().unwrap()["tw"],
+        ("6.4.1".to_owned(), TW_HASH.to_owned())
+    );
+
+    // The node now matches: nothing more is sent.
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_patch_level_downgrade_is_refused() {
+    let h = harness(TOKEN).await;
+    // The node holds a patch release; the package's manifest says 6.4.0.
+    h.node.set("tw", "6.4.1", "newer-hash");
+    let error = haruki_failure(&h.config).await;
+    assert!(
+        error.contains("refusing downgrade 6.4.1 -> 6.4.0"),
+        "{error}"
+    );
+    assert!(h.node.posts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_package_without_a_manifest_version_falls_back_to_the_zeroed_config_version() {
+    let fixture = xapk_with_manifest("com.hermes.mk.asia", ("6", "4", "1"), None, TW_HASH);
+    let h = harness_with(TOKEN, fixture).await;
+    h.node.set("tw", "6.3.0", "old-hash");
+    let runner = Runner::new(h.config.clone()).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    let identity = report.identity.unwrap();
+    assert_eq!(identity.app_version, "6.4.0");
+    assert_eq!(identity.client_version, "6.4.1");
+    let posts = h.node.posts.lock().unwrap().clone();
+    assert_eq!(posts[0]["appVersion"], "6.4.0");
+}
+
+#[tokio::test]
+async fn state_written_by_0_2_is_not_pushed_again() {
+    let h = harness(TOKEN).await;
+    h.node.set("tw", "6.3.0", "old-hash");
+    let runner = Runner::new(h.config.clone()).unwrap();
+    assert!(runner.run_once(&[ServerRegion::Tw], PUBLISH).await[0].is_ok());
+    assert_eq!(h.node.posts.lock().unwrap().len(), 1);
+
+    // Rewrite the cached identity the way 0.2.0 stored it: the config
+    // version as appVersion and none of the newer fields.
+    let path = h.config.state.dir.join("tw.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let identity = state["identity"].as_object_mut().unwrap();
+    identity.insert("appVersion".into(), "6.4.1".into());
+    identity.remove("appVersionSource");
+    identity.remove("clientVersion");
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    // The node holds the normalized 6.4.0, as 0.2.0 left it. Neither a
+    // second push nor a downgrade refusal: the region is unchanged.
+    assert_eq!(
+        h.node.versions.lock().unwrap()["tw"],
+        ("6.4.0".to_owned(), TW_HASH.to_owned())
+    );
+    let runner = Runner::new(h.config.clone()).unwrap();
+    let report = runner
+        .run_once(&[ServerRegion::Tw], PUBLISH)
+        .await
+        .remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert!(!report.extracted);
+    assert_eq!(report.identity.unwrap().app_version, "6.4.0");
     assert_eq!(h.node.posts.lock().unwrap().len(), 1);
 }
 

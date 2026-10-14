@@ -30,7 +30,8 @@ src/
   player_settings.rs – External TypeTree for Sekai.PlayerSettingConfig (Android/Base
                        layouts) and the decoded struct
   extract.rs         – Package walk: manifest + Unity data candidates + nested APKs
-  identity.rs        – AppIdentity output model, version comparison, Nuverse normalization
+  identity.rs        – AppIdentity output model, login app version (manifest for Nuverse),
+                       version comparison, upgrade of identities cached by 0.2.x
   config.rs          – TOML + SEKAI_APPHASH_* env overrides (figment), Secret type
   state.rs           – Per-region state (fingerprint, identity, delivery digests)
   publish.rs         – Haruki / file / webhook publishers
@@ -64,10 +65,15 @@ tests/
   fails unless the tree consumes the object exactly, which is what tells layouts apart. When
   the game adds or reorders fields, update `STRING_FIELDS` / the Android trailer and the
   synthetic encoder in `testing.rs` together.
-- **Versions.** `appVersion` is `clientMajor.clientMinor.clientBuild` as extracted (Nuverse
-  6.4.1). Haruki-Sekai-API normalizes Nuverse versions to `major.minor.0`;
-  `identity::server_app_version` mirrors that only for the publisher's comparison and
-  downgrade check, never in the output.
+- **Versions.** `appVersion` is the version a client logs in with
+  (`identity::login_app_version`): JP/EN the config's `clientMajor.clientMinor.clientBuild`;
+  TW/KR/CN the base manifest's `versionName` (the config can be ahead, e.g. manifest 6.4.0,
+  config 6.4.1), falling back to the config version with the patch zeroed (WARN) when the
+  manifest has none. The config version is always `clientVersion`; `appVersionSource` says
+  which rule applied. The Haruki publisher compares, checks for downgrades (full `x.y.z`) and
+  posts `appVersion` as is. `StateStore::load` upgrades identities cached before
+  `clientVersion` existed (`AppIdentity::upgrade_cached`), so a 0.2.x state does not cause a
+  push or a downgrade refusal.
 - **Haruki contract.** `POST /internal/app-identity` with `Authorization: Bearer
   <backend.internal_token>` and `{server, appVersion, appHash}`; the node answers HTTP 200 with
   an envelope `{ok, data: {changed, appVersion, appHash}}` or `{ok: false, kind, message}`, 401
