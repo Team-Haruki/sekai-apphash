@@ -482,13 +482,33 @@ pub struct Fixture {
 /// configs among unrelated MonoBehaviours and other objects.
 #[must_use]
 pub fn xapk(package: &str, version: (&str, &str, &str), app_hash: &str) -> Fixture {
+    let store_version = format!("{}.{}.0", version.0, version.1);
+    xapk_with_manifest(package, version, Some(&store_version), app_hash)
+}
+
+/// [`xapk`] whose base manifest has `version_name` as `versionName` (none:
+/// no `versionName` attribute) instead of the config's `major.minor.0`.
+#[must_use]
+pub fn xapk_with_manifest(
+    package: &str,
+    version: (&str, &str, &str),
+    version_name: Option<&str>,
+    app_hash: &str,
+) -> Fixture {
     let (bundle, production) = nuverse_bundle(package, version, app_hash);
-    let base = zip_archive(&[
-        (
-            "AndroidManifest.xml",
-            &base_manifest(package, &format!("{}.{}.0", version.0, version.1), 4242),
+    let base_manifest = match version_name {
+        Some(name) => base_manifest(package, name, 4242),
+        None => manifest(
+            &[Attr {
+                name: "package",
+                resource_id: None,
+                value: AttrValue::Text(package),
+            }],
             true,
         ),
+    };
+    let base = zip_archive(&[
+        ("AndroidManifest.xml", &base_manifest, true),
         ("classes.dex", b"dex\n035\0", true),
     ]);
     let pack = zip_archive(&[

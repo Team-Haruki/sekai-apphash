@@ -483,7 +483,7 @@ impl Runner {
             .filter(|s| !force && s.fingerprint == resolved.fingerprint)
             .and_then(|s| s.identity.clone());
         if let Some(cached) = cached {
-            info!(%region, source = source.label(), app_version = %cached.app_version, "Package unchanged; reusing cached identity");
+            info!(%region, source = source.label(), app_version = %cached.app_version, client_version = %cached.client_version, "Package unchanged; reusing cached identity");
             return Ok(cached);
         }
         let info = match resolved.package {
@@ -507,6 +507,8 @@ impl Runner {
                     %region,
                     source = source.label(),
                     app_version = %identity.app_version,
+                    app_version_source = ?identity.app_version_source,
+                    client_version = %identity.client_version,
                     app_hash = %identity.app_hash,
                     previous = ?state.identity.as_ref().map(|i| i.app_version.clone()),
                     "New app identity"

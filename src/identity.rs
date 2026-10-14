@@ -3,6 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use tracing::warn;
+
 use crate::axml::ManifestInfo;
 use crate::error::{Error, Result};
 use crate::extract::PackageScan;
@@ -19,7 +21,18 @@ pub struct AppIdentity {
     pub region: ServerRegion,
     /// The config the identity was taken from (`production_android`).
     pub config: String,
+    /// The version a client logs in with: the config's client version for
+    /// JP/EN, the manifest `versionName` for TW/KR/CN (see
+    /// [`login_app_version`]).
     pub app_version: String,
+    /// Where `app_version` came from.
+    #[serde(default)]
+    pub app_version_source: AppVersionSource,
+    /// `clientMajor.clientMinor.clientBuild` of the config (informational
+    /// for TW/KR/CN, where it can be ahead of the version the server
+    /// accepts). Empty only in state written before it existed.
+    #[serde(default)]
+    pub client_version: String,
     pub app_hash: String,
     /// `clientDataMajor.Minor.Build` from the same config.
     pub data_version: String,
@@ -69,6 +82,20 @@ impl From<ManifestInfo> for PackageManifest {
             version_code: info.version_code,
         }
     }
+}
+
+/// Where an identity's `appVersion` came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppVersionSource {
+    /// The config's client version (JP/EN).
+    #[default]
+    Config,
+    /// The base APK manifest's `versionName` (TW/KR/CN).
+    Manifest,
+    /// TW/KR/CN without a usable manifest `versionName`: the config's client
+    /// version with the patch part zeroed.
+    ConfigPatchZeroed,
 }
 
 /// The package the identity was read from.
@@ -148,10 +175,16 @@ impl AppIdentity {
         })?;
         // The config's bundleIdentifier is not checked: the Nuverse builds come
         // from the same Unity project and carry the JP identifier there.
+        let client_version = config.app_version();
+        let manifest = scan.manifest.map(PackageManifest::from);
+        let (app_version, app_version_source) =
+            login_app_version(region, manifest.as_ref(), &client_version);
         Ok(Self {
             region,
             config: config.name.clone(),
-            app_version: config.app_version(),
+            app_version,
+            app_version_source,
+            client_version,
             app_hash: config.client_app_hash.clone(),
             data_version: config.data_version(),
             ab_version: config.ab_version(),
@@ -162,7 +195,7 @@ impl AppIdentity {
             product_name: config.product_name.clone(),
             company_name: config.company_name.clone(),
             version_suffix: config.client_version_suffix.clone(),
-            manifest: scan.manifest.map(PackageManifest::from),
+            manifest,
             unity_version: scan.unity.unity_version,
             unity_file: scan
                 .unity_path
@@ -176,12 +209,29 @@ impl AppIdentity {
         })
     }
 
+    /// Brings an identity cached by an older version up to date: before
+    /// `clientVersion` existed, `appVersion` held the config's client version
+    /// for every region. Re-deriving it from the cached manifest means an
+    /// unchanged package is not re-downloaded and yields the same
+    /// `appVersion` a fresh extraction would.
+    pub fn upgrade_cached(&mut self) {
+        if !self.client_version.is_empty() {
+            return;
+        }
+        self.client_version = std::mem::take(&mut self.app_version);
+        let (app_version, source) =
+            login_app_version(self.region, self.manifest.as_ref(), &self.client_version);
+        self.app_version = app_version;
+        self.app_version_source = source;
+    }
+
     /// The fields that matter for change detection (not timestamps or
     /// download statistics).
     #[must_use]
-    pub fn essence(&self) -> (&str, &str, &str, Option<&str>) {
+    pub fn essence(&self) -> (&str, &str, &str, &str, Option<&str>) {
         (
             &self.app_version,
+            &self.client_version,
             &self.app_hash,
             &self.data_version,
             self.manifest
@@ -212,13 +262,44 @@ pub fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(a.cmp(&b))
 }
 
-/// The app version Haruki-Sekai-API stores for `region`: Nuverse servers
-/// accept the `major.minor.0` of a build, so the patch part is zeroed there.
+/// The app version a client of `region` logs in with.
+///
+/// JP/EN: the config's client version. TW/KR/CN: the servers accept the
+/// store version, the base APK manifest's `versionName`, while the config can
+/// carry a later internal build (manifest `6.4.0`, config `6.4.1`); a real
+/// patch release raises the manifest version too. Without a usable manifest
+/// version the config's client version with the patch zeroed is the best
+/// guess, logged as a warning.
 #[must_use]
-pub fn server_app_version(region: ServerRegion, version: &str) -> String {
+pub fn login_app_version(
+    region: ServerRegion,
+    manifest: Option<&PackageManifest>,
+    client_version: &str,
+) -> (String, AppVersionSource) {
     if region.is_cp() {
-        return version.to_owned();
+        return (client_version.to_owned(), AppVersionSource::Config);
     }
+    let manifest_version = manifest
+        .and_then(|m| m.version_name.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(version) = manifest_version.filter(|v| version_parts(v).is_some()) {
+        return (version.to_owned(), AppVersionSource::Manifest);
+    }
+    let fallback = zero_patch(client_version);
+    warn!(
+        %region,
+        manifest_version = ?manifest_version,
+        client_version,
+        app_version = %fallback,
+        "No usable manifest versionName; using the config version with the patch zeroed"
+    );
+    (fallback, AppVersionSource::ConfigPatchZeroed)
+}
+
+/// `major.minor.0` of a three-part version; anything else unchanged.
+#[must_use]
+pub fn zero_patch(version: &str) -> String {
     match version_parts(version).as_deref() {
         Some([major, minor, _]) => format!("{major}.{minor}.0"),
         _ => version.to_owned(),
@@ -234,10 +315,18 @@ mod tests {
     use crate::unity::UnityScan;
 
     fn scan(configs: Vec<PlayerSettings>, package: &str) -> PackageScan {
+        scan_with(configs, package, Some("6.4.0"))
+    }
+
+    fn scan_with(
+        configs: Vec<PlayerSettings>,
+        package: &str,
+        version_name: Option<&str>,
+    ) -> PackageScan {
         PackageScan {
             manifest: Some(ManifestInfo {
                 package: package.into(),
-                version_name: Some("6.4.0".into()),
+                version_name: version_name.map(Into::into),
                 version_code: Some(1),
             }),
             unity: UnityScan {
@@ -262,7 +351,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(identity.app_version, "6.4.1");
+        // TW logs in with the manifest version, not the config's 6.4.1.
+        assert_eq!(identity.app_version, "6.4.0");
+        assert_eq!(identity.app_version_source, AppVersionSource::Manifest);
+        assert_eq!(identity.client_version, "6.4.1");
         assert_eq!(identity.app_hash, "prod-hash");
         assert_eq!(identity.configs.len(), 2);
         assert_eq!(
@@ -271,6 +363,9 @@ mod tests {
         );
         let json = serde_json::to_value(&identity).unwrap();
         assert_eq!(json["appHash"], "prod-hash");
+        assert_eq!(json["appVersion"], "6.4.0");
+        assert_eq!(json["appVersionSource"], "manifest");
+        assert_eq!(json["clientVersion"], "6.4.1");
         assert_eq!(json["manifest"]["versionName"], "6.4.0");
 
         let wrong = AppIdentity::from_scan(
@@ -344,13 +439,107 @@ mod tests {
     }
 
     #[test]
-    fn compares_and_normalizes_versions() {
+    fn compares_versions() {
         assert_eq!(compare_versions("7.0.0", "6.8.1"), Some(Ordering::Greater));
         assert_eq!(compare_versions("6.4", "6.4.0"), Some(Ordering::Equal));
         assert_eq!(compare_versions("6.4.0", "6.10.0"), Some(Ordering::Less));
+        assert_eq!(compare_versions("6.4.0", "6.4.1"), Some(Ordering::Less));
         assert_eq!(compare_versions("6.x", "6.4.0"), None);
-        assert_eq!(server_app_version(ServerRegion::Cn, "6.4.1"), "6.4.0");
-        assert_eq!(server_app_version(ServerRegion::Jp, "7.0.1"), "7.0.1");
-        assert_eq!(server_app_version(ServerRegion::Kr, "6.4"), "6.4");
+        assert_eq!(zero_patch("6.4.1"), "6.4.0");
+        assert_eq!(zero_patch("6.4"), "6.4");
+    }
+
+    fn manifest(version_name: Option<&str>) -> PackageManifest {
+        PackageManifest {
+            package: "com.example".into(),
+            version_name: version_name.map(Into::into),
+            version_code: None,
+        }
+    }
+
+    #[test]
+    fn nuverse_regions_log_in_with_the_manifest_version() {
+        for region in [ServerRegion::Tw, ServerRegion::Kr, ServerRegion::Cn] {
+            // The manifest wins, a patch release included.
+            assert_eq!(
+                login_app_version(region, Some(&manifest(Some("6.4.0"))), "6.4.1"),
+                ("6.4.0".to_owned(), AppVersionSource::Manifest)
+            );
+            assert_eq!(
+                login_app_version(region, Some(&manifest(Some(" 5.2.2 "))), "5.2.2"),
+                ("5.2.2".to_owned(), AppVersionSource::Manifest)
+            );
+            // No manifest, no versionName, or an unusable one: zeroed config version.
+            for fallback in [None, Some(manifest(None)), Some(manifest(Some("6.4.0-qa")))] {
+                assert_eq!(
+                    login_app_version(region, fallback.as_ref(), "6.4.1"),
+                    ("6.4.0".to_owned(), AppVersionSource::ConfigPatchZeroed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jp_and_en_keep_the_config_version() {
+        for region in [ServerRegion::Jp, ServerRegion::En] {
+            assert_eq!(
+                login_app_version(region, Some(&manifest(Some("7.0.0"))), "7.0.1"),
+                ("7.0.1".to_owned(), AppVersionSource::Config)
+            );
+            assert_eq!(
+                login_app_version(region, None, "7.0.1"),
+                ("7.0.1".to_owned(), AppVersionSource::Config)
+            );
+        }
+    }
+
+    #[test]
+    fn falls_back_to_the_zeroed_config_version_without_a_manifest_version() {
+        let identity = AppIdentity::from_scan(
+            ServerRegion::Cn,
+            "android",
+            scan_with(
+                vec![sample("production_android", ("6", "4", "1"), "h")],
+                "com.hermes.mk.asia",
+                None,
+            ),
+            &["com.hermes.mk.asia".to_owned()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(identity.app_version, "6.4.0");
+        assert_eq!(
+            identity.app_version_source,
+            AppVersionSource::ConfigPatchZeroed
+        );
+        assert_eq!(identity.client_version, "6.4.1");
+    }
+
+    #[test]
+    fn identities_cached_before_client_version_are_upgraded() {
+        let fresh = AppIdentity::from_scan(
+            ServerRegion::Tw,
+            "android",
+            scan(
+                vec![sample("production_android", ("6", "4", "1"), "h")],
+                "com.hermes.mk.asia",
+            ),
+            &[],
+            None,
+        )
+        .unwrap();
+        // What 0.2.0 wrote: the config version as appVersion, no new fields.
+        let mut old = serde_json::to_value(&fresh).unwrap();
+        old["appVersion"] = "6.4.1".into();
+        let old = old.as_object_mut().unwrap();
+        old.remove("appVersionSource");
+        old.remove("clientVersion");
+        let mut cached: AppIdentity = serde_json::from_value(old.clone().into()).unwrap();
+        assert!(cached.client_version.is_empty());
+        cached.upgrade_cached();
+        assert_eq!(cached, fresh);
+        // Idempotent.
+        cached.upgrade_cached();
+        assert_eq!(cached, fresh);
     }
 }

@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
@@ -94,6 +94,9 @@ pub struct MockNode {
     pub auth_headers: Arc<Mutex<Vec<String>>>,
     /// When set, `GET .../version` answers this bare status instead.
     pub version_status: Arc<Mutex<Option<StatusCode>>>,
+    /// Stores Nuverse versions as posted, like a node with
+    /// `pin_app_version_patch_to_zero = false` (default: zeroes the patch).
+    pub keep_patch: Arc<AtomicBool>,
 }
 
 impl MockNode {
@@ -131,8 +134,8 @@ impl MockNode {
 }
 
 /// Mirrors the node's zero-patch normalization for Nuverse regions.
-fn effective(region: &str, version: &str) -> String {
-    if matches!(region, "jp" | "en") {
+fn effective(region: &str, version: &str, keep_patch: bool) -> String {
+    if keep_patch || matches!(region, "jp" | "en") {
         return version.into();
     }
     let parts: Vec<&str> = version.split('.').collect();
@@ -177,7 +180,11 @@ async fn node_identity(State(node): State<MockNode>, headers: HeaderMap, body: B
     let request: Value = serde_json::from_slice(&body).unwrap();
     node.posts.lock().unwrap().push(request.clone());
     let server = request["server"].as_str().unwrap().to_owned();
-    let version = effective(&server, request["appVersion"].as_str().unwrap_or_default());
+    let version = effective(
+        &server,
+        request["appVersion"].as_str().unwrap_or_default(),
+        node.keep_patch.load(Ordering::SeqCst),
+    );
     let hash = request["appHash"].as_str().unwrap_or_default().to_owned();
     let mut versions = node.versions.lock().unwrap();
     let changed = versions.get(&server) != Some(&(version.clone(), hash.clone()));

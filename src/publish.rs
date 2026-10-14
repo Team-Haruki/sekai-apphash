@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::config::{FilePublisherConfig, HarukiPublisherConfig, PublishConfig, WebhookConfig};
 use crate::error::{Error, Result};
-use crate::identity::{compare_versions, server_app_version, AppIdentity};
+use crate::identity::{compare_versions, AppIdentity};
 use crate::server::ServerRegion;
 use crate::state::{digest, write_atomic};
 
@@ -235,7 +235,8 @@ impl HarukiPublisher {
     /// Whether `expected` may be pushed over the node's `current` identity.
     /// An empty node identity passes only for a region listed in
     /// `bootstrap_regions`. Otherwise, with `refuse_downgrade`, an older or
-    /// incomparable version is refused.
+    /// incomparable version is refused; the full versions are compared, so a
+    /// patch-level rollback (6.4.1 -> 6.4.0) counts as a downgrade.
     fn check_current(
         &self,
         region: ServerRegion,
@@ -273,7 +274,9 @@ impl HarukiPublisher {
         if !in_filter(&self.config.regions, region) {
             return Ok(Outcome::Skipped);
         }
-        let expected = server_app_version(region, &identity.app_version);
+        // `appVersion` already is what the region's clients log in with (the
+        // manifest version for TW/KR/CN), so it is compared and sent as is.
+        let expected = identity.app_version.as_str();
         // Fail closed: without the node's current identity neither the
         // "already there" nor the downgrade check can run, so nothing is sent.
         // The error is logged by `Publishers::publish` and fails the run.
@@ -285,14 +288,14 @@ impl HarukiPublisher {
         if !force && current.app_version == expected && current.app_hash == identity.app_hash {
             return Ok(Outcome::Unchanged);
         }
-        self.check_current(region, &current, &expected)?;
+        self.check_current(region, &current, expected)?;
         let response = self
             .client
             .post(self.url("/internal/app-identity"))
             .header(AUTHORIZATION, self.bearer())
             .json(&json!({
                 "server": region.as_str(),
-                "appVersion": identity.app_version,
+                "appVersion": expected,
                 "appHash": identity.app_hash,
             }))
             .send()

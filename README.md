@@ -32,6 +32,12 @@ long-running service that publishes changes to
    supplied as an external type tree and each candidate MonoBehaviour is read through
    unity-rs's type-tree reader, which rejects objects the layout does not describe exactly.
    The identity comes from `production_android` (or `production_ios`).
+6. **App version.** JP/EN clients log in with the config's client version. The TW/KR/CN
+   servers accept the store version, the manifest `versionName`; the config there can carry a
+   later internal build (manifest `6.4.0`, config `6.4.1`), and a real patch release raises the
+   manifest version too. So `appVersion` is the manifest `versionName` for TW/KR/CN, and the
+   config's version is kept as `clientVersion`. A Nuverse package without a usable manifest
+   version falls back to the config's version with the patch zeroed, with a warning.
 
 ## Usage
 
@@ -63,7 +69,9 @@ Logs go to stderr (`log.format = "json"` for structured output); stdout carries 
     "tw": {
       "region": "tw",
       "config": "production_android",
-      "appVersion": "6.4.1",
+      "appVersion": "6.4.0",
+      "appVersionSource": "manifest",
+      "clientVersion": "6.4.1",
       "appHash": "d67a688b-ff78-4300-bfc5-2120c000d75d",
       "dataVersion": "1.0.0",
       "abVersion": "6.4.0",
@@ -80,8 +88,12 @@ Logs go to stderr (`log.format = "json"` for structured output); stdout carries 
 ```
 
 `dataVersion` is the client's bundled `clientData*Version`, not the server's master data
-version. Nuverse servers accept `major.minor.0` of a build, so Haruki Sekai API stores TW/KR/CN
-`6.4.1` as `6.4.0`; the extracted value is reported unchanged.
+version. `appVersionSource` is `config` (JP/EN), `manifest` (TW/KR/CN) or
+`config-patch-zeroed` (TW/KR/CN without a usable manifest `versionName`). An identity cached
+by 0.2.x (where `appVersion` was the config's version for every region) is re-derived from its
+cached manifest when it is loaded, so upgrading neither re-downloads nor re-pushes an unchanged
+package; the file and webhook publishers deliver each region once more, since the payload
+gained fields.
 
 ### Configuration
 
@@ -154,9 +166,11 @@ Tokens and secrets are never logged or printed (`Debug` shows `<redacted>`).
 
 - **haruki** — `POST {base_url}/internal/app-identity` with `Authorization: Bearer <token>` and
   `{"server", "appVersion", "appHash"}`. The node's current identity is read first from
-  `GET /internal/master/{region}/version`: nothing is sent when it already matches (after the
-  node's Nuverse normalization), and an older version is refused unless
-  `refuse_downgrade = false`. The publisher fails closed: when that read fails (network error,
+  `GET /internal/master/{region}/version`: nothing is sent when it already matches, and an
+  older version, compared in full (`6.4.1` -> `6.4.0` is a downgrade), is refused unless
+  `refuse_downgrade = false`. A node that still zeroes the patch of TW/KR/CN versions
+  (Haruki Sekai API's `pin_app_version_patch_to_zero`) stores a patch release as `x.y.0`; the
+  publisher then posts it again on each run and the node answers "unchanged". The publisher fails closed: when that read fails (network error,
   non-200 status such as the 404 of a node without `internal_token`, or an `{ok: false}`
   envelope such as a missing version file) nothing is sent and the region counts as failed, so
   `run` exits non-zero. With `refuse_downgrade` on, a node version that cannot be compared is
