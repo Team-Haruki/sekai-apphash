@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 # Unity parsing. Pinned exactly: the bundle/serialized-file APIs used here are
 # still moving between minor releases.
-unity-rs-core = "=0.6.0"
+unity-rs-core = "=0.6.1"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
