@@ -104,6 +104,9 @@ pub struct HttpConfig {
     pub connect_timeout_secs: u64,
     /// Per request, including range requests.
     pub timeout_secs: u64,
+    /// Per request for the small lookups that decide what to read: the QooApp
+    /// store API and the one-byte range probe (at most `timeout_secs`).
+    pub lookup_timeout_secs: u64,
     /// Optional proxy for source downloads (`http://`, `socks5://`).
     pub proxy: Option<String>,
     /// Range cache page size.
@@ -118,6 +121,7 @@ impl Default for HttpConfig {
             user_agent: concat!("sekai-apphash/", env!("CARGO_PKG_VERSION")).into(),
             connect_timeout_secs: 15,
             timeout_secs: 120,
+            lookup_timeout_secs: 30,
             proxy: None,
             page_size_kib: 256,
             cache_mib: 128,
@@ -149,6 +153,10 @@ pub struct ScheduleConfig {
     pub jitter_secs: u64,
     /// Upper bound for one region's check, extraction and delivery.
     pub region_timeout_secs: u64,
+    /// Waits before trying a region's sources again when every one failed
+    /// with a connection, TLS or timeout error. Shared by all regions of a
+    /// pass: one outage costs at most their sum per pass. Empty = no retry.
+    pub retry_delays_secs: Vec<u64>,
 }
 
 impl Default for ScheduleConfig {
@@ -157,6 +165,7 @@ impl Default for ScheduleConfig {
             interval_secs: 600,
             jitter_secs: 120,
             region_timeout_secs: 900,
+            retry_delays_secs: vec![30, 45, 60],
         }
     }
 }

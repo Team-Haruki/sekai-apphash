@@ -38,8 +38,9 @@ src/
   publish.rs         – Haruki / file / webhook / asset-updater publishers
   qooapp.rs          – QooApp v11 store API answer -> package URL + MD5 fingerprint
   runner.rs          – One pass: per region, try the sources in order (resolve ->
-                       reuse cache or extract), then publish; source HTTP clients
-                       (global and per-source proxy) and channel headers
+                       reuse cache or extract), retry the region on transient
+                       errors (shared per-pass RetryBudget), then publish; source
+                       HTTP clients (global and per-source proxy) and channel headers
   service.rs         – Scheduler with jitter, read-only status endpoints (axum)
   logging.rs         – tracing to stderr, text or JSON
   testing.rs         – Synthetic fixture builders (doc-hidden; used by all tests)
@@ -95,6 +96,12 @@ tests/
   `HeaderValue`s): never log them, and keep them out of committed config (tokens come from
   `SEKAI_APPHASH_CHANNELS__<NAME>__HEADERS__<HEADER>`). The manifest package must be the
   region's or listed in the source's `packages`.
+- **Retries.** `error::Error::Transient` marks failures without an HTTP answer (reqwest
+  connect/timeout/request-without-status, or a reset/EOF io cause); messages carry the full
+  source chain (`error::chain`), never the URL. `Runner::obtain` re-tries all of a region's
+  sources only when every tried source failed transiently, with the waits of
+  `schedule.retry_delays_secs` shared by the whole pass (`RetryBudget`), so the worst case
+  stays bounded. Statuses and parse errors are never retried; publishing is after the loop.
 - **Caching.** `state/<region>.json` keeps the source fingerprint (size, ETag, Last-Modified,
   redirect path without query) and the identity. Unchanged fingerprint = no download.
   File/webhook deliveries are skipped when the stable digest (identity without timestamps and

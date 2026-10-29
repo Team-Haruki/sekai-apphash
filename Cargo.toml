@@ -45,7 +45,7 @@ rand = "0.10"
 mimalloc = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["process"] }
+tokio = { version = "1", features = ["process", "io-util"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tempfile = "3"
 figment = { version = "0.10", features = ["toml", "env", "test"] }

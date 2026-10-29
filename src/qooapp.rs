@@ -8,6 +8,8 @@
 //! with `{package_id}` replaced. Either way the reported MD5 identifies the
 //! build, so an unchanged build costs one API request and no download.
 
+use std::time::Duration;
+
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 
@@ -133,16 +135,19 @@ pub fn parse(body: &[u8], download_template: &str) -> Result<Release> {
     })
 }
 
-/// Asks the store API at `check_url` for the app's current package.
+/// Asks the store API at `check_url` for the app's current package, giving up
+/// after `timeout`.
 pub async fn resolve(
     client: &reqwest::Client,
     check_url: &str,
     download_template: &str,
     headers: &HeaderMap,
+    timeout: Duration,
 ) -> Result<Release> {
     let response = client
         .get(check_url)
         .headers(headers.clone())
+        .timeout(timeout)
         .send()
         .await?;
     let status = response.status();

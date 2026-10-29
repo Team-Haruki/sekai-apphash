@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,49 @@ pub struct RunOptions {
     pub force: bool,
     /// Run the publishers.
     pub publish: bool,
+}
+
+/// The waits before re-trying regions whose sources all failed transiently,
+/// shared by every region of one pass. An outage that hits all regions is
+/// waited out once (by the first region); when it outlasts the schedule, the
+/// remaining regions fail at once instead of each waiting again.
+#[derive(Debug)]
+pub struct RetryBudget {
+    delays: Vec<Duration>,
+    used: AtomicUsize,
+}
+
+impl RetryBudget {
+    #[must_use]
+    pub fn new(delays_secs: &[u64]) -> Self {
+        Self {
+            delays: delays_secs
+                .iter()
+                .map(|s| Duration::from_secs(*s))
+                .collect(),
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    /// The next retry (1-based) and its wait, or `None` when spent.
+    pub fn next(&self) -> Option<(usize, Duration)> {
+        let index = self.used.fetch_add(1, Ordering::Relaxed);
+        self.delays.get(index).map(|delay| (index + 1, *delay))
+    }
+
+    /// The most a pass can wait in total.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.delays.iter().sum()
+    }
+}
+
+/// Every enabled source of a region failed.
+struct SourcesFailed {
+    error: Error,
+    /// At least one source was tried and every tried source failed with a
+    /// transient error (skipped sources do not count).
+    transient: bool,
 }
 
 pub struct Runner {
@@ -365,7 +409,24 @@ impl Runner {
     /// state.
     pub async fn extract(&self, region: ServerRegion) -> Result<AppIdentity> {
         let mut extracted = false;
-        self.obtain(region, true, None, &mut extracted).await
+        let retry = self.retry_budget();
+        self.obtain(region, true, None, &mut extracted, &retry)
+            .await
+    }
+
+    /// A fresh retry schedule for one pass.
+    #[must_use]
+    pub fn retry_budget(&self) -> RetryBudget {
+        RetryBudget::new(&self.config.schedule.retry_delays_secs)
+    }
+
+    fn lookup_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.config
+                .http
+                .lookup_timeout_secs
+                .clamp(1, self.config.http.timeout_secs.max(1)),
+        )
     }
 
     /// Finds out what `source` currently serves.
@@ -379,16 +440,27 @@ impl Runner {
         let client = self.client_for(region, index);
         match source.kind {
             SourceKind::Direct => {
-                let info = remote::probe(client, &source.download_url, headers).await?;
+                let info = remote::probe_within(
+                    client,
+                    &source.download_url,
+                    headers,
+                    self.lookup_timeout(),
+                )
+                .await?;
                 Ok(Resolved {
                     fingerprint: info.fingerprint(),
                     package: Package::Probed(info),
                 })
             }
             SourceKind::Qooapp => {
-                let release =
-                    qooapp::resolve(client, &source.check_url, &source.download_url, headers)
-                        .await?;
+                let release = qooapp::resolve(
+                    client,
+                    &source.check_url,
+                    &source.download_url,
+                    headers,
+                    self.lookup_timeout(),
+                )
+                .await?;
                 debug!(
                     %region,
                     source = source.label(),
@@ -410,16 +482,57 @@ impl Runner {
 
     /// Tries the region's sources in order and returns the first identity.
     /// With `state`, an unchanged package reuses the cached identity and a
-    /// new one is recorded there; `force` re-extracts regardless.
+    /// new one is recorded there; `force` re-extracts regardless. When every
+    /// source failed transiently, waits and tries them all again while
+    /// `retry` allows. Only this lookup repeats; nothing is published here.
     async fn obtain(
         &self,
         region: ServerRegion,
         force: bool,
         mut state: Option<&mut RegionState>,
         extracted: &mut bool,
+        retry: &RetryBudget,
     ) -> Result<AppIdentity> {
-        let region_config = self.region_config(region)?;
+        loop {
+            let failed = match self
+                .obtain_once(region, force, state.as_deref_mut(), extracted)
+                .await
+            {
+                Ok(identity) => return Ok(identity),
+                Err(failed) => failed,
+            };
+            if !failed.transient {
+                return Err(failed.error);
+            }
+            let Some((attempt, delay)) = retry.next() else {
+                return Err(failed.error);
+            };
+            warn!(
+                %region,
+                retry = attempt,
+                delay_secs = delay.as_secs(),
+                error = %failed.error,
+                "Every source failed with a connection error; retrying the region"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// One try of the region's sources in order.
+    async fn obtain_once(
+        &self,
+        region: ServerRegion,
+        force: bool,
+        mut state: Option<&mut RegionState>,
+        extracted: &mut bool,
+    ) -> Result<AppIdentity, SourcesFailed> {
+        let region_config = self.region_config(region).map_err(|error| SourcesFailed {
+            error,
+            transient: false,
+        })?;
         let mut failures = Vec::new();
+        let mut tried = 0usize;
+        let mut transient = 0usize;
         for (index, source) in region_config.effective_sources().iter().enumerate() {
             if !source.enabled {
                 continue;
@@ -435,6 +548,7 @@ impl Runner {
                 ));
                 continue;
             }
+            tried += 1;
             let attempt = self
                 .obtain_from(
                     region,
@@ -455,14 +569,20 @@ impl Runner {
                 }
                 Err(error) => {
                     warn!(%region, source = source.label(), %error, "Source failed");
+                    if error.is_transient() {
+                        transient += 1;
+                    }
                     failures.push(format!("{}: {error}", source.label()));
                 }
             }
         }
-        Err(Error::Other(format!(
-            "no source yielded the identity ({})",
-            failures.join("; ")
-        )))
+        Err(SourcesFailed {
+            error: Error::Other(format!(
+                "no source yielded the identity ({})",
+                failures.join("; ")
+            )),
+            transient: tried > 0 && transient == tried,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -489,8 +609,13 @@ impl Runner {
         let info = match resolved.package {
             Package::Probed(info) => info,
             Package::Url { url, display } => {
-                let mut info =
-                    remote::probe(self.client_for(region, index), &url, &headers).await?;
+                let mut info = remote::probe_within(
+                    self.client_for(region, index),
+                    &url,
+                    &headers,
+                    self.lookup_timeout(),
+                )
+                .await?;
                 // Reports show the URL without its (possibly signed) query.
                 info.url = display;
                 info
@@ -523,6 +648,15 @@ impl Runner {
     /// Checks one region: reuse the cached identity when the package is
     /// unchanged, extract otherwise, then publish.
     pub async fn check(&self, region: ServerRegion, options: RunOptions) -> RegionReport {
+        self.check_with(region, options, &self.retry_budget()).await
+    }
+
+    async fn check_with(
+        &self,
+        region: ServerRegion,
+        options: RunOptions,
+        retry: &RetryBudget,
+    ) -> RegionReport {
         let timeout = Duration::from_secs(self.config.schedule.region_timeout_secs.max(1));
         let mut report = RegionReport {
             region,
@@ -532,7 +666,12 @@ impl Runner {
             publish_errors: Vec::new(),
             checked_at: Utc::now(),
         };
-        match tokio::time::timeout(timeout, self.check_inner(region, options, &mut report)).await {
+        match tokio::time::timeout(
+            timeout,
+            self.check_inner(region, options, retry, &mut report),
+        )
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(error)) => report.error = Some(error.to_string()),
             Err(_) => report.error = Some(format!("timed out after {}s", timeout.as_secs())),
@@ -547,6 +686,7 @@ impl Runner {
         &self,
         region: ServerRegion,
         options: RunOptions,
+        retry: &RetryBudget,
         report: &mut RegionReport,
     ) -> Result<()> {
         let mut state = self.state.load(region).await;
@@ -556,6 +696,7 @@ impl Runner {
                 options.force,
                 Some(&mut state),
                 &mut report.extracted,
+                retry,
             )
             .await?;
         if options.publish && !self.publishers.is_empty() {
@@ -575,15 +716,16 @@ impl Runner {
         Ok(())
     }
 
-    /// Checks `regions` one after another.
+    /// Checks `regions` one after another, sharing one retry schedule.
     pub async fn run_once(
         &self,
         regions: &[ServerRegion],
         options: RunOptions,
     ) -> Vec<RegionReport> {
+        let retry = self.retry_budget();
         let mut reports = Vec::with_capacity(regions.len());
         for &region in regions {
-            reports.push(self.check(region, options).await);
+            reports.push(self.check_with(region, options, &retry).await);
         }
         reports
     }
@@ -591,3 +733,20 @@ impl Runner {
 
 /// Shared handle for the service mode.
 pub type SharedRunner = Arc<Runner>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_retry_schedule_is_shared_and_bounded() {
+        let budget = RetryBudget::new(&Config::default().schedule.retry_delays_secs);
+        assert_eq!(budget.total(), Duration::from_secs(135));
+        assert_eq!(budget.next(), Some((1, Duration::from_secs(30))));
+        assert_eq!(budget.next(), Some((2, Duration::from_secs(45))));
+        assert_eq!(budget.next(), Some((3, Duration::from_secs(60))));
+        assert_eq!(budget.next(), None);
+        assert_eq!(budget.next(), None);
+        assert_eq!(RetryBudget::new(&[]).next(), None);
+    }
+}

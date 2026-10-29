@@ -16,6 +16,7 @@ format = "text"         # text | json
 user_agent = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 connect_timeout_secs = 15
 timeout_secs = 120
+lookup_timeout_secs = 30  # QooApp store API and range probe (capped by timeout_secs)
 # proxy = "socks5://127.0.0.1:1080"
 page_size_kib = 256     # range request granularity
 cache_mib = 128         # range cache budget per package
@@ -28,6 +29,10 @@ dir = "state"
 interval_secs = 600     # serve: time between passes
 jitter_secs = 120       # plus a random 0..=jitter_secs
 region_timeout_secs = 900
+# When every source of a region fails with a connection, TLS or timeout error,
+# wait and try them all again. One schedule per pass, shared by its regions;
+# HTTP errors (4xx/5xx) and unusable answers are never retried. [] = off.
+retry_delays_secs = [30, 45, 60]
 
 [service]
 # serve: read-only GET /health, /v1/identity, /v1/identity/{region}. "" = off.
