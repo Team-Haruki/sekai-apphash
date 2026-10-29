@@ -247,19 +247,25 @@ impl HttpFetcher {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let outcome =
-                match range_request(&self.client, &self.url, &self.headers, start, end_inclusive)
-                    .await
-                {
-                    Ok(response) if response.status() == StatusCode::PARTIAL_CONTENT => {
-                        match response.bytes().await {
-                            Ok(body) => return Ok(body.to_vec()),
-                            Err(error) => Error::from(error).to_string(),
-                        }
+            let outcome = match range_request(
+                &self.client,
+                &self.url,
+                &self.headers,
+                start,
+                end_inclusive,
+                None,
+            )
+            .await
+            {
+                Ok(response) if response.status() == StatusCode::PARTIAL_CONTENT => {
+                    match response.bytes().await {
+                        Ok(body) => return Ok(body.to_vec()),
+                        Err(error) => Error::from(error).to_string(),
                     }
-                    Ok(response) => format!("HTTP {}", response.status()),
-                    Err(error) => error.to_string(),
-                };
+                }
+                Ok(response) => format!("HTTP {}", response.status()),
+                Err(error) => error.to_string(),
+            };
             if attempt > self.retries {
                 return Err(io::Error::other(format!(
                     "range {start}-{end_inclusive}: {outcome}"
@@ -284,20 +290,42 @@ async fn range_request(
     headers: &HeaderMap,
     start: u64,
     end_inclusive: u64,
+    timeout: Option<Duration>,
 ) -> Result<reqwest::Response> {
-    Ok(client
+    let mut request = client
         .get(url)
         .headers(headers.clone())
         .header(RANGE, format!("bytes={start}-{end_inclusive}"))
-        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"))
-        .send()
-        .await?)
+        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    Ok(request.send().await?)
 }
 
 /// Resolves `url` (following redirects), checks that it serves byte ranges and
 /// returns what the probe learned.
 pub async fn probe(client: &reqwest::Client, url: &str, headers: &HeaderMap) -> Result<RemoteInfo> {
-    let response = range_request(client, url, headers, 0, 0).await?;
+    probe_request(client, url, headers, None).await
+}
+
+/// [`probe`] with its own request timeout instead of the client's.
+pub async fn probe_within(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    timeout: Duration,
+) -> Result<RemoteInfo> {
+    probe_request(client, url, headers, Some(timeout)).await
+}
+
+async fn probe_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    timeout: Option<Duration>,
+) -> Result<RemoteInfo> {
+    let response = range_request(client, url, headers, 0, 0, timeout).await?;
     let status = response.status();
     if status != StatusCode::PARTIAL_CONTENT {
         return Err(Error::Http(format!(

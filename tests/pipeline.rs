@@ -603,6 +603,8 @@ async fn a_region_proxy_overrides_the_global_one() {
     let mut config = config_for(format!("http://{addr}/pkg"));
     config.http.proxy = Some(dead_proxy.clone());
     config.http.connect_timeout_secs = 2;
+    // A dead proxy is a connection error; do not wait out the retry schedule.
+    config.schedule.retry_delays_secs.clear();
     let runner = Runner::new(config.clone()).unwrap();
     assert!(runner.extract(ServerRegion::Tw).await.is_err());
 

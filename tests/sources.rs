@@ -4,7 +4,9 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use sekai_apphash::config::{
     ChannelConfig, Config, RegionConfig, Secret, SourceConfig, SourceKind, StateConfig,
@@ -285,4 +287,82 @@ async fn switching_sources_re_extracts() {
     let runner = Runner::new(s.config(QOO_TOKEN, vec![s.qoo_source()])).unwrap();
     let report = runner.run_once(&[ServerRegion::Tw], RUN).await.remove(0);
     assert!(report.is_ok() && report.extracted, "{report:?}");
+}
+
+/// Forwards connections to `target`, closing the first `drop_first` at once
+/// (what a proxy whose upstream is gone looks like). Counts connections.
+async fn flaky_front(target: SocketAddr, drop_first: usize) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let seen = connections.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if seen.fetch_add(1, Ordering::SeqCst) < drop_first {
+                drop(socket);
+                continue;
+            }
+            tokio::spawn(async move {
+                if let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
+                }
+            });
+        }
+    });
+    (addr, connections)
+}
+
+#[tokio::test]
+async fn a_region_is_retried_after_connection_errors() {
+    let s = setup().await;
+    let (front, connections) = flaky_front(s.store_addr, 2).await;
+    let mut source = s.qoo_source();
+    source.check_url = format!("http://{front}/store/v11/apps/75057");
+    let mut config = s.config(QOO_TOKEN, vec![source]);
+    config.schedule.retry_delays_secs = vec![0, 0, 0];
+    let runner = Runner::new(config).unwrap();
+
+    let report = runner.run_once(&[ServerRegion::Tw], RUN).await.remove(0);
+    assert!(report.is_ok(), "{report:?}");
+    assert!(report.extracted);
+    // Two dropped connections, then the store answered once.
+    assert_eq!(connections.load(Ordering::SeqCst), 3);
+    assert_eq!(s.store.store_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retries_stop_when_the_schedule_is_spent() {
+    let s = setup().await;
+    let (front, connections) = flaky_front(s.store_addr, usize::MAX).await;
+    let mut source = s.qoo_source();
+    source.check_url = format!("http://{front}/store/v11/apps/75057");
+    let mut config = s.config(QOO_TOKEN, vec![source]);
+    config.schedule.retry_delays_secs = vec![0, 0];
+    let runner = Runner::new(config).unwrap();
+
+    let error = runner.run_once(&[ServerRegion::Tw], RUN).await[0]
+        .error
+        .clone()
+        .unwrap();
+    assert_eq!(connections.load(Ordering::SeqCst), 3);
+    // The cause is spelled out, not just "error sending request".
+    assert!(
+        error.contains("qooapp: http: error sending request: "),
+        "{error}"
+    );
+    assert!(!error.contains(&front.to_string()), "{error}");
+}
+
+#[tokio::test]
+async fn http_errors_are_not_retried() {
+    let s = setup().await;
+    let mut config = s.config("wrong", vec![s.qoo_source(), s.mirror_source("/plain")]);
+    config.schedule.retry_delays_secs = vec![0, 0, 0];
+    let runner = Runner::new(config).unwrap();
+    let error = runner.run_once(&[ServerRegion::Tw], RUN).await[0]
+        .error
+        .clone()
+        .unwrap();
+    assert!(error.contains("qooapp store answered HTTP 401"), "{error}");
+    assert_eq!(s.store.store_requests.load(Ordering::SeqCst), 1);
 }

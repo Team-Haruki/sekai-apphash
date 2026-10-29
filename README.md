@@ -118,6 +118,16 @@ hosts that reach some download sources only through a proxy.
 order until one yields the identity; a disabled source is passed over, and a failing one is
 logged and the next one tried. `run` fails for the region only when every source failed.
 
+When every source failed without an HTTP answer (connection refused or reset, TLS handshake
+failure, timeout: typically a proxy outage), the region's sources are tried again after the
+waits in `schedule.retry_delays_secs` (default 30, 45 and 60 s). The schedule belongs to the
+pass, not the region: an outage that hits every region is waited out once, and when it lasts
+longer the remaining regions fail at once. An HTTP status, a refused token or an unusable
+answer is never retried, and only the lookup repeats: publishing runs once, after it. Failures
+are logged with their full cause (`error sending request: client error (Connect): ...`). The
+store API request and the range probe have their own, shorter timeout
+(`http.lookup_timeout_secs`, 30 s).
+
 ```toml
 [[regions.tw.sources]]
 name = "mirror"
